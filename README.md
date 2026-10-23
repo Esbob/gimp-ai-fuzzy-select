@@ -105,6 +105,26 @@ Useful options:
 The ViTMatte checkpoint is downloaded from Google Drive, which sometimes refuses
 downloads; the installer then explains how to download it by hand.
 
+## Uninstalling
+
+```
+python uninstall_ai_select.py
+```
+
+This shows what it will remove and asks first: the plug-in from every GIMP 3 profile
+(including your remembered options), the install folder with its virtual environment,
+sources and downloaded checkpoints, and the plug-in's log file. Checkpoints you gave the
+installer with `--sam2-checkpoint` or `--vitmatte-checkpoint` are yours and are kept.
+Close GIMP first.
+
+| Option | Use |
+|---|---|
+| `--dry-run` | Only show what would be removed |
+| `--yes` | Don't ask for confirmation |
+| `--keep-checkpoints` | Keep the downloaded checkpoints, e.g. for a later reinstall |
+| `--install-dir PATH` | The install folder, if it isn't found from the plug-in's settings |
+| `--gimp-plugins-dir PATH` | Only remove the plug-in from this plug-ins folder |
+
 ## Credits and licences
 
 This plug-in is MIT-licensed (see [LICENSE](LICENSE)). The installer downloads, at pinned
