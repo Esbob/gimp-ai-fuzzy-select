@@ -1,7 +1,8 @@
 """
-Backend for the GIMP "AI Select" plugin. Runs in the Matte Anything virtual environment
-and stays alive while the plugin window is open, so SAM2 is loaded and the image is
-encoded only once; each click then costs only SAM2's small mask decoder.
+Backend for the GIMP "AI Fuzzy Select" plugin. Runs in the plugin's own virtual
+environment (made by install_ai_select.py) and stays alive while the plugin window is
+open, so SAM2 is loaded and the image is encoded only once; each click then costs only
+SAM2's small mask decoder.
 
 Protocol: one JSON object per line on stdin, one JSON reply per line on stdout.
   {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h}

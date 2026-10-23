@@ -7,7 +7,7 @@ out which pixels belong to it. The result is a normal GIMP selection with marchi
 
 ## What the plug-in does
 
-**Select > AI Select...** opens a window with your image (what is currently visible) and a
+**Select > AI Fuzzy Select...** opens a window with your image (what is currently visible) and a
 compact options sidebar. GIMP plug-ins can't receive clicks on the canvas itself, so you
 click in this window; when you press **Select**, the result becomes GIMP's selection.
 
@@ -89,7 +89,7 @@ python install_ai_select.py
 This creates a virtual environment in `%LOCALAPPDATA%\gimp-ai-select` (on Windows),
 installs PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the
 checkpoints, copies the plug-in into GIMP's `plug-ins` folder and runs a set of tests.
-Then restart GIMP and use **Select > AI Select...**.
+Then restart GIMP and use **Select > AI Fuzzy Select...**.
 
 Useful options:
 

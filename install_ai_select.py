@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-Installer for AI Select, an "AI Fuzzy Select" plugin for GIMP 3: click an object and SAM2
-selects it; Shift+click adds, Ctrl+click removes; the result is a normal GIMP selection.
+Installer for AI Fuzzy Select, a GIMP 3 plugin that works like Fuzzy Select but selects
+by object: click an object and SAM2 selects it; Shift+click adds, Ctrl+click removes; the
+result is a normal GIMP selection.
 
 What it does:
   1. Creates a virtual environment with the Python running this script (3.10-3.13).
@@ -543,7 +544,7 @@ def run_gimp_test(py, gimp_console, work):
     report_file = Path(args["report"])
     report = json.loads(report_file.read_text()) if report_file.exists() else {}
     if "exception" in report or not Path(args["mask_out"]).exists():
-        fail(f"AI Select failed inside GIMP: {report or 'no report (is the plugin registered?)'}")
+        fail(f"AI Fuzzy Select failed inside GIMP: {report or 'no report (is the plugin registered?)'}")
         return False
     score = ("import numpy as np, sys; t = np.load(sys.argv[1]); "
              "m = np.fromfile(sys.argv[2], np.uint8).reshape(t.shape) / 255; "
@@ -614,7 +615,7 @@ def run_tests(py, settings, plugin_dir, soft, expect_cuda, gimp_console):
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Install and test AI Select for GIMP 3.")
+    parser = argparse.ArgumentParser(description="Install and test AI Fuzzy Select for GIMP 3.")
     parser.add_argument("--install-dir", type=Path, default=default_install_dir(),
                         help="where the environment, sources and checkpoints go (default: %(default)s)")
     parser.add_argument("--gimp-plugins-dir", type=Path, help="GIMP 3 plug-ins folder (default: auto-detected)")
@@ -652,7 +653,7 @@ def main():
         sys.exit("No GIMP 3 user profile found. Start GIMP 3 once, or pass --gimp-plugins-dir.")
     gimp_console = find_gimp_console()
 
-    print("AI Select installer")
+    print("AI Fuzzy Select installer")
     info(f"Install dir : {install_dir}")
     info(f"GPU         : {f'{gpu[0]} (compute {gpu[1]})' if gpu else 'none detected'}")
     info(f"PyTorch     : {index} wheels")
@@ -697,7 +698,7 @@ def main():
 
     print("\n" + "=" * 72)
     print("All tests passed." if passed else "Some tests FAILED - see the output above.")
-    print("  In GIMP (restart it if it's open): Select > AI Select...")
+    print("  In GIMP (restart it if it's open): Select > AI Fuzzy Select...")
     print("=" * 72)
     sys.exit(0 if passed else 1)
 

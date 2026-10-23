@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-GIMP 3 plugin: Select > AI Select...
+GIMP 3 plugin: Select > AI Fuzzy Select...
 
 An AI "fuzzy select": instead of growing a selection over similar colours, it selects
 the object you click on, using SAM2. GIMP plugins can't receive clicks on the canvas, so
@@ -118,7 +118,7 @@ class Backend:
         while not done.wait(0.1):
             Gimp.progress_pulse()
             if time.time() - t0 > timeout:
-                return {"ok": False, "error": "The AI Select backend timed out."}
+                return {"ok": False, "error": "The AI Fuzzy Select backend timed out."}
         return box["reply"]
 
     def _worker(self):
@@ -136,7 +136,7 @@ class Backend:
                 reply = None
             if reply is None:
                 tail = "".join(self.stderr_tail).strip()
-                reply = {"ok": False, "error": f"The AI Select backend stopped.\n\n{tail}"}
+                reply = {"ok": False, "error": f"The AI Fuzzy Select backend stopped.\n\n{tail}"}
             if main_loop:
                 GLib.idle_add(callback, reply)
             else:
@@ -181,7 +181,7 @@ class AISelectDialog(Gtk.Dialog):
 
     def __init__(self, backend, image_png, image_size, preview_png, preview_size, options,
                  soft_available=True):
-        super().__init__(title="AI Select", modal=True)
+        super().__init__(title="AI Fuzzy Select", modal=True)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
         self.select_button = self.add_button("_Select", Gtk.ResponseType.OK)
         self.select_button.set_sensitive(False)
@@ -900,7 +900,7 @@ def apply_selection(image, raw_file, operation):
     # silently do nothing. Remember the selection of items and restore it afterwards.
     layers, channels = image.get_selected_layers(), image.get_selected_channels()
     paths = image.get_selected_paths()
-    channel = Gimp.Channel.new(image, "AI Select", w, h, 100, Gegl.Color.new("black"))
+    channel = Gimp.Channel.new(image, "AI Fuzzy Select", w, h, 100, Gegl.Color.new("black"))
     channel.set_visible(False)  # a visible channel flashes as an overlay on the canvas
     image.insert_channel(channel, None, 0)
     # Write in the channel's own colour model so 50% stays 50% (see the Matte Anything
@@ -956,7 +956,7 @@ def ai_select(procedure, run_mode, image, config):
     except Exception:
         import traceback
         log("EXCEPTION\n" + traceback.format_exc())
-        error = "AI Select failed unexpectedly:\n\n" + traceback.format_exc(limit=3)
+        error = "AI Fuzzy Select failed unexpectedly:\n\n" + traceback.format_exc(limit=3)
     log(f"returning error={error!r}; selection now: {selection_summary(image)}")
     return error
 
@@ -968,7 +968,7 @@ def soft_edges_available(settings):
 def ai_select_steps(procedure, run_mode, image, config):
     settings = load_json(SETTINGS_FILE, None)
     if not settings:
-        return "AI Select isn't set up. Run install_ai_select.py."
+        return "AI Fuzzy Select isn't set up. Run install_ai_select.py."
     options = dict(DEFAULT_OPTIONS, **load_json(OPTIONS_FILE, {}))
     work = tempfile.mkdtemp(prefix="aiselect_")
     backend = None
@@ -1002,7 +1002,7 @@ def ai_select_steps(procedure, run_mode, image, config):
             if not reply["ok"]:
                 return reply["error"]
 
-        Gimp.progress_init("AI Select: creating selection...")
+        Gimp.progress_init("AI Fuzzy Select: creating selection...")
         out = os.path.join(work, "selection.raw")
         req = {"cmd": "render", "objects": objects, "final": True, "out": out}
         for key in RENDER_OPTIONS:
@@ -1041,7 +1041,7 @@ class AISelect(Gimp.PlugIn):
         procedure.set_image_types("RGB*, GRAY*")
         procedure.set_sensitivity_mask(Gimp.ProcedureSensitivityMask.DRAWABLE
                                        | Gimp.ProcedureSensitivityMask.NO_DRAWABLES)
-        procedure.set_menu_label("_AI Select...")
+        procedure.set_menu_label("_AI Fuzzy Select...")
         procedure.add_menu_path("<Image>/Select")
         procedure.set_documentation(
             "Select the object you click on (AI fuzzy select)",
@@ -1049,7 +1049,7 @@ class AISelect(Gimp.PlugIn):
             "it instead of over similar colours. Click to select, Shift+click to add, "
             "Ctrl+click to remove; the result becomes a normal selection.",
             name)
-        procedure.set_attribution("AI Select plugin", "MIT", "2026")
+        procedure.set_attribution("AI Fuzzy Select plugin", "MIT", "2026")
         rw = GObject.ParamFlags.READWRITE
         # Used when called from scripts (the window passes its own state).
         procedure.add_string_argument("objects", "Objects (JSON)",
