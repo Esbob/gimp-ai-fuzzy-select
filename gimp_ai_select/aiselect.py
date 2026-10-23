@@ -220,14 +220,22 @@ class AISelectDialog(Gtk.Dialog):
     # --- layout ---
 
     def size_to_screen(self):
+        """Open maximized. The un-maximized size (what Windows restores to when the window
+        is dragged) leaves room for the title bar and taskbar: at the full work-area size,
+        the title bar pushed Cancel/Select below the bottom of the screen."""
+        # A normal window, not a dialog: Windows gives dialogs no maximize button and may
+        # ignore maximizing them.
+        self.set_type_hint(Gdk.WindowTypeHint.NORMAL)
         display = Gdk.Display.get_default()
         monitor = display.get_primary_monitor() or display.get_monitor(0) if display else None
         if monitor is not None:
             area = monitor.get_workarea()
-            self.set_default_size(area.width, area.height)
+            self.set_default_size(int(area.width * 0.9), int(area.height * 0.85))
         else:
-            self.set_default_size(1600, 1000)
-        self.maximize()
+            self.set_default_size(1400, 850)
+        self.set_position(Gtk.WindowPosition.CENTER)
+        # Maximize once the window is on screen; requested earlier, it isn't always honoured.
+        self.connect("map", lambda w: GLib.idle_add(w.maximize))
 
     def build_ui(self):
         provider = Gtk.CssProvider()
