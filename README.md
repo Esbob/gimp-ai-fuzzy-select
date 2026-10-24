@@ -5,6 +5,8 @@ selects by *object* instead of by *colour*: click on something in the image and
 [SAM 2](https://github.com/facebookresearch/sam2) (Meta's Segment Anything Model 2) works
 out which pixels belong to it. The result is a normal GIMP selection with marching ants.
 
+**Contents:** [What it does](#what-the-plug-in-does) · [Requirements](#requirements) · [Installation](#installation) · [Uninstalling](#uninstalling) · [Credits](#credits-and-licences)
+
 ## What the plug-in does
 
 **Select > AI Fuzzy Select...** opens a window with your image (what is currently visible) and a
