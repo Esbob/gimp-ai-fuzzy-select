@@ -14,20 +14,28 @@ Protocol: one JSON object per line in each direction. In --listen mode a connect
 starts with {"cmd": "hello", "token": ...}.
   {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h,
    "guide": raw}
-      encode the image; "preview" is where render writes its overlay. "guide": the user's
-      GIMP selection (8-bit, image size); the reply's "guide" then has "prompts" (a "box"
-      and "point" for the object in each separate area) and its "polygons" outline
+      encode the image (with "width" and "height", "image" is raw 8-bit RGBA instead, and
+      "transparent_black" blacks out the hidden colour of fully transparent pixels, as
+      GIMP's PNG export does for RGB images); "preview" is where render writes its
+      overlay. "guide": the user's GIMP selection (8-bit, image size); the reply's "guide"
+      then has "prompts" (a "box" and "point" for the object in each separate area) and
+      its "polygons" outline
   {"cmd": "render", "objects": [...], "threshold": 0-100, "granularity": "auto"|"detail"|
-   "part"|"whole", "fill_holes": px, "grow": px, "feather": px, "soft": false,
+   "part"|"whole", "fill_holes": px, "grow": px, "feather": px, "soft": false, "sharp": false,
    "final": false, "soft_preview": false, "out": raw, "preview_out": png}
       objects: [{"sign": 1 or -1, "points": [[x, y, label], ...]} or
                 {"sign": 1 or -1, "box": [x1, y1, x2, y2], "points": [[x, y, 1]] (optional)},
                 ...] in image pixels;
       the selection is (union of sign 1 objects) minus (union of sign -1 objects).
       Not final: write a tinted preview overlay PNG with an outline to "preview_out"
-      (with "soft" and "soft_preview": ViTMatte edges computed at reduced size;
+      (with "soft_preview": "soft" edges too, computed at reduced size;
       "view": "mask" writes the selection as a white-on-black image instead).
       Final: write the full-size 8-bit selection to "out" (optionally with ViTMatte edges).
+      "sharp": sharper outlines, worked out in the background; a preview uses the ones
+      that are ready and the reply's "sharp_pending" counts those still being worked out
+      ("sharp_refined": those used). A final render waits for them.
+  {"cmd": "sharp_status"}
+      {"pending": number of sharper outlines still being worked out}
   {"cmd": "hover", "point": [x, y], "threshold": 0-100, "granularity": ...}
       the outline a click there would select: {"polygons": [[[x, y], ...], ...]}
   {"cmd": "bye"}   end this connection (in --listen mode the server waits for the next)
@@ -36,12 +44,14 @@ Every reply has "id" (echoed from the request) and "ok", plus "error" on failure
 """
 
 import collections
+import contextlib
 import hashlib
 import hmac
 import json
 import os
 import socket
 import sys
+import threading
 import time
 import traceback
 
@@ -82,6 +92,16 @@ class Server:
         # SAM2's analysis of recent images, so reopening the window on the same image is
         # instant: image hash -> (image, predictor state)
         self.analysed = collections.OrderedDict()
+        # Sharper outlines take seconds per object, so a background thread works them out
+        # (with its own predictor on the same model, and its own CUDA stream) while clicks
+        # and hover go on as usual. Each load starts a new generation; results for an
+        # earlier image are dropped.
+        self.crop_predictor = None
+        self.sharp_lock = threading.Condition()
+        self.sharp_jobs = []  # [(key, generation, obj, coarse logits, image)], oldest first
+        self.sharp_busy = None  # (key, generation) being worked out
+        self.sharp_done = {}  # key -> (x1, y1, x2, y2, crop logits), or None: keep the normal one
+        self.generation = 0
 
     # --- models --------------------------------------------------------------------
 
@@ -92,6 +112,8 @@ class Server:
         model = build_sam2("configs/sam2/sam2_hiera_l.yaml", self.settings["sam2Checkpoint"],
                            device=self.device)
         self.predictor = SAM2ImagePredictor(model)
+        self.crop_predictor = SAM2ImagePredictor(model)
+        threading.Thread(target=self.sharp_worker, daemon=True).start()
 
     def load_vitmatte(self):
         from detectron2.checkpoint import DetectionCheckpointer
@@ -119,13 +141,23 @@ class Server:
         t0 = time.time()
         if self.predictor is None:
             self.load_sam2()
-        image = cv2.imread(req["image"], cv2.IMREAD_COLOR)
-        if image is None:
-            raise ValueError(f"Could not read {req['image']}")
-        self.image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        if req.get("width"):  # raw 8-bit RGBA from the plugin
+            rgba = np.fromfile(req["image"], np.uint8).reshape(req["height"], req["width"], 4)
+            self.image = rgba[..., :3].copy()
+            if req.get("transparent_black"):
+                self.image[rgba[..., 3] == 0] = 0
+        else:
+            image = cv2.imread(req["image"], cv2.IMREAD_COLOR)
+            if image is None:
+                raise ValueError(f"Could not read {req['image']}")
+            self.image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         self.preview_path = req["preview"]
         self.preview_size = (req["preview_width"], req["preview_height"])
         self.cache.clear()
+        with self.sharp_lock:
+            self.generation += 1
+            self.sharp_jobs.clear()
+            self.sharp_done.clear()
         key = hashlib.sha1(self.image.tobytes()).hexdigest() + str(self.image.shape)
         cached = key in self.analysed
         if cached:
@@ -218,6 +250,104 @@ class Server:
             self.cache[key] = (masks[0], low[0])
         return self.cache[key][0]
 
+    @staticmethod
+    def sharp_key(obj, granularity):
+        return ("sharp", granularity, json.dumps(obj.get("box")), json.dumps(obj.get("points")))
+
+    def sharp_logits(self, obj, granularity, coarse, wait):
+        """Sharper outline for one object: SAM2 again, on a crop around the object, at its
+        own 1024 px. SAM2's masks come out at a quarter of its 1024 px input, so on a
+        4000 px photo each mask cell covers about 16x16 pixels. On 4000x2600 test images
+        with known outlines (20 objects, 150-2000 px, by click and by box) this raised the
+        share of the outline within 2 px from 0.49-0.65 to 0.94-0.97 for objects up to
+        600 px, 0.76 to 0.92 at 1200 px and 0.63 to 0.74 at 2000 px, never worse, for about
+        2 s per object on a GTX 1050 Ti (up to 15 s once the laptop GPU throttles from heat);
+        a guided filter on the photo did less. Cached per object.
+
+        Worked out on the background thread (sharp_worker); with `wait` this waits for it,
+        otherwise it returns the normal logits until it is ready. Returns (logits, state),
+        state "done", "pending" or "skipped" (the normal outline is kept)."""
+        key = self.sharp_key(obj, granularity)
+        with self.sharp_lock:
+            job = (key, self.generation)
+            if (key not in self.sharp_done and self.sharp_busy != job
+                    and all(j[:2] != job for j in self.sharp_jobs)):
+                self.sharp_jobs.append((key, self.generation, obj, coarse, self.image))
+                self.sharp_lock.notify_all()
+            while wait and key not in self.sharp_done:
+                self.sharp_lock.wait()
+            if key not in self.sharp_done:
+                return coarse, "pending"
+            refined = self.sharp_done[key]
+        if refined is None:
+            return coarse, "skipped"
+        x1, y1, x2, y2, crop_logits = refined
+        out = coarse.copy()
+        out[y1:y2, x1:x2] = crop_logits
+        return out, "done"
+
+    def sharp_worker(self):
+        stream = torch.cuda.Stream() if self.device == "cuda" else None
+        while True:
+            with self.sharp_lock:
+                while not self.sharp_jobs:
+                    self.sharp_lock.wait()
+                key, generation, obj, coarse, image = self.sharp_jobs.pop(0)
+                self.sharp_busy = (key, generation)
+            try:
+                with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
+                    refined = self.refine_in_crop(obj, coarse, image)
+            except Exception:
+                traceback.print_exc()
+                refined = None  # keep the normal outline
+            with self.sharp_lock:
+                self.sharp_busy = None
+                if generation == self.generation:
+                    self.sharp_done[key] = refined
+                self.sharp_lock.notify_all()
+
+    def cmd_sharp_status(self, req):
+        with self.sharp_lock:
+            pending = sum(j[1] == self.generation for j in self.sharp_jobs)
+            pending += bool(self.sharp_busy and self.sharp_busy[1] == self.generation)
+        return {"pending": pending}
+
+    def refine_in_crop(self, obj, coarse, image):
+        h, w = coarse.shape
+        mask = coarse > 0
+        if not mask.any():
+            return None
+        ys, xs = np.nonzero(mask)
+        bx1, by1, bx2, by2 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+        mx, my = (bx2 - bx1) // 10 + 16, (by2 - by1) // 10 + 16
+        x1, y1, x2, y2 = max(bx1 - mx, 0), max(by1 - my, 0), min(bx2 + mx, w), min(by2 + my, h)
+        if (x2 - x1) * (y2 - y1) > 0.7 * w * h:
+            return None  # the object fills most of the image: nothing to zoom into
+        pred = self.crop_predictor
+        point = obj["points"][0][:2] if obj.get("points") else None
+        with torch.no_grad():
+            pred.set_image(np.ascontiguousarray(image[y1:y2, x1:x2]))
+            # The object's extent as a box, the click, and the normal mask itself as SAM2's
+            # mask prompt keep it on the same object: seen this much larger, SAM2 otherwise
+            # often picked another one (on real photos 41 of 207 refinements overlapped the
+            # normal result by less than half; with the mask prompt, 23).
+            kwargs = {"box": np.array([bx1 - x1, by1 - y1, bx2 - x1, by2 - y1], dtype=np.float32),
+                      "mask_input": cv2.resize(coarse[y1:y2, x1:x2], (256, 256),
+                                               interpolation=cv2.INTER_AREA)[None]}
+            if point:
+                kwargs["point_coords"] = np.array([[point[0] - x1, point[1] - y1]], dtype=np.float32)
+                kwargs["point_labels"] = np.array([1])
+            masks, _, _ = pred.predict(multimask_output=False, return_logits=True, **kwargs)
+        # Only the outline may move, by at most one cell of SAM2's own mask grid (where the
+        # normal result is coarse); the object itself stays the one the user picked.
+        edge = cv2.morphologyEx(mask[y1:y2, x1:x2].astype(np.uint8), cv2.MORPH_GRADIENT,
+                                np.ones((3, 3), np.uint8))
+        near = cv2.distanceTransform(1 - edge, cv2.DIST_L2, 5) <= max(h, w) / 256
+        refined = np.where(near, masks[0], coarse[y1:y2, x1:x2])
+        if point and coarse[point[1], point[0]] > 0 and refined[point[1] - y1, point[0] - x1] <= 0:
+            return None  # never lose the clicked spot
+        return x1, y1, x2, y2, refined
+
     def outline(self, mask):
         """A mask's outline as polygons in image pixels, traced at preview resolution."""
         h, w = mask.shape
@@ -270,16 +400,26 @@ class Server:
         add = np.zeros((h, w), bool)
         sub = np.zeros((h, w), bool)
         granularity = req.get("granularity", "auto")
+        sharp = bool(req.get("sharp"))
+        wanted = {self.sharp_key(o, granularity) for o in req["objects"]} if sharp else set()
+        with self.sharp_lock:  # forget queued work for objects that are gone (undo, new click)
+            self.sharp_jobs = [j for j in self.sharp_jobs if j[0] in wanted]
+        self.sharp_pending = self.sharp_refined = 0
         for obj in req["objects"]:
             points = obj.get("points", [])
             if obj.get("box"):
                 point = points[0][:2] if points else None  # e.g. from the GIMP selection
-                mask = self.box_logits(obj["box"], point) > cut
+                logits = self.box_logits(obj["box"], point)
                 points = []  # a box object has no refinement clicks
             elif points:
-                mask = self.object_logits(points, granularity) > cut
+                logits = self.object_logits(points, granularity)
             else:
                 continue
+            if sharp and len(obj.get("points", [])) <= 1:
+                logits, state = self.sharp_logits(obj, granularity, logits, wait=bool(req.get("final")))
+                self.sharp_pending += state == "pending"
+                self.sharp_refined += state == "done"
+            mask = logits > cut
             # SAM2 sometimes ignores a refinement click (e.g. an "exclude" inside a uniform
             # object). Keep the Fuzzy Select promise anyway: a Shift-clicked spot ends up
             # selected and a Ctrl-clicked spot ends up deselected, by adding or removing
@@ -362,8 +502,9 @@ class Server:
             # A fresh file per preview, so the window can read one while the next is written.
             path = req.get("preview_out") or self.preview_path
             self.write_preview(alpha, path, req.get("view", "overlay"))
-            return {"area": area, "seconds": round(time.time() - t0, 3), "preview": path}
-        return {"area": area, "seconds": round(time.time() - t0, 3)}
+            return {"area": area, "seconds": round(time.time() - t0, 3), "preview": path,
+                    "sharp_pending": self.sharp_pending, "sharp_refined": self.sharp_refined}
+        return {"area": area, "seconds": round(time.time() - t0, 3), "sharp_refined": self.sharp_refined}
 
     def write_preview(self, alpha, path, view="overlay"):
         pw, ph = self.preview_size

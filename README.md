@@ -55,6 +55,7 @@ is held.
 | Fill holes | Fill holes in the selection up to this diameter in pixels, e.g. a window in a wall you want selected as solid. Only holes completely surrounded by the selection are filled, and SAM 2 already includes holes smaller than about 10 px. 0 (default) = off, keeps every hole (e.g. sky between branches) |
 | Grow/shrink | Grow or shrink the selection, in pixels |
 | Feather | Soften the selection edge, in pixels |
+| Sharper outlines | More accurate outlines on large photos, especially for small objects: each object is looked at again on a crop around it. Takes a few seconds per object, in the background; the preview updates when it's ready |
 | Soft edges (ViTMatte) | Turn fuzzy edges such as fur and hair into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte), picking out individual hairs near the object's outline. On hard edges it mostly makes the outline smoother and more accurate. The effect is best seen in the **Mask** view. The preview shows soft edges a moment after each change; pressing **Select** computes them at full resolution |
 | Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; or a **Channel**, leaving GIMP's selection alone. The button's label changes to match |
 | Existing selection in GIMP | Only for a Selection result, and only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
@@ -79,7 +80,8 @@ pixels show as grey.
 A backend process (in its own Python environment) loads SAM 2 and analyses the image
 once. After that each click only runs SAM 2's small mask decoder, so updates take about
 0.05–0.3 seconds. Clicks are evaluated at SAM 2's working resolution (1024 px on the long
-side); on large photos use **Soft edges** or **Feather** for fine edges.
+side); on large photos use **Sharper outlines** for more accurate outlines, and **Soft edges** or
+**Feather** for soft ones.
 
 The backend stays loaded between runs and remembers the analysis of the last few images,
 so only the first run has to wait for the model. Measured on a GeForce GTX 1050 Ti from

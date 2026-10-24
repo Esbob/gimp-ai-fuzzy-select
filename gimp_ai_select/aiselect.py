@@ -45,7 +45,7 @@ gi.require_version("Babl", "0.1")
 gi.require_version("Gtk", "3.0")
 gi.require_version("Gdk", "3.0")
 gi.require_version("GdkPixbuf", "2.0")
-from gi.repository import Babl, Gdk, GdkPixbuf, Gegl, Gimp, GimpUi, Gio, GLib, GObject, Gtk
+from gi.repository import Babl, Gdk, GdkPixbuf, Gegl, Gimp, GimpUi, GLib, GObject, Gtk
 
 import cairo
 
@@ -58,9 +58,9 @@ PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 
 DEFAULT_OPTIONS = {
     "output": "selection", "hover": True, "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
-    "soft": False, "edge": 4, "operation": "replace",
+    "sharp": False, "soft": False, "edge": 4, "operation": "replace",
 }
-RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "soft", "edge")
+RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "sharp", "soft", "edge")
 # Result choices: dropdown text and the label of the dialog's main button.
 OUTPUTS = {
     "selection": ("Selection", "_Select"),
@@ -278,7 +278,7 @@ class AISelectDialog(Gtk.Dialog):
     resolution; the selection overlay comes from the backend at preview resolution.
     `zoom` is screen pixels per image pixel, as in GIMP."""
 
-    def __init__(self, backend, image_png, image_size, preview_png, preview_size, options,
+    def __init__(self, backend, image_load, image_size, preview_png, preview_size, options,
                  soft_available=True, has_selection=True, guide_raw=None):
         super().__init__(title="AI Fuzzy Select", modal=True)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
@@ -300,12 +300,17 @@ class AISelectDialog(Gtk.Dialog):
         self.busy = True  # set_busy() below; on_draw may run first
         self.zoom = 1.0
         self.fit_mode = True  # keep fitting the image to the view until the user zooms
-        self.base = surface_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file(image_png))
+        w, h = image_size
+        with open(image_load["image"], "rb") as f:
+            pixels = GLib.Bytes.new(f.read())
+        self.base = surface_from_pixbuf(GdkPixbuf.Pixbuf.new_from_bytes(
+            pixels, GdkPixbuf.Colorspace.RGB, True, 8, w, h, w * 4))
         self.base_scaled = None  # base pre-scaled for the current zoom, when zoomed out
         self.overlay = None
         self.preview_count = 0
         self.version = 0  # bumped on every change; older preview results are discarded
         self.soft_timer = None
+        self.sharp_timer = None  # polls the backend while sharper outlines are worked out
         self.pan_start = None
         self.drag = None  # a left/right button press in progress: click or box
         self.guide = None  # prompt for the object inside GIMP's selection, and its outline
@@ -321,8 +326,8 @@ class AISelectDialog(Gtk.Dialog):
         self.connect("key-press-event", self.on_key)
         self.connect("key-release-event", self.on_key_release)
         self.set_busy("Loading model and analysing image...")
-        load = {"cmd": "load", "image": image_png, "preview": preview_png,
-                "preview_width": preview_size[0], "preview_height": preview_size[1]}
+        load = dict(image_load, cmd="load", preview=preview_png, preview_width=preview_size[0],
+                    preview_height=preview_size[1])
         if guide_raw:
             load["guide"] = guide_raw  # GIMP's current selection, to start from
         self.backend.request(load, self.on_loaded)
@@ -505,6 +510,21 @@ class AISelectDialog(Gtk.Dialog):
         self.feather = spin(0, 200, "feather")
         add_row("Feather (px)", self.feather, "Soften the selection edge by this radius")
 
+        self.sharp = Gtk.CheckButton(label="Sharper outlines (slower)")
+        self.sharp.set_active(self.options["sharp"])
+        self.sharp.set_tooltip_text(
+            "SAM2 works on the image scaled to 1024 px, so on large photos outlines are coarse. "
+            "This looks at each object again on a crop around it, for a more accurate outline, "
+            "especially for objects that are small compared with the photo. Only the outline "
+            "moves: the object stays the one you picked.\n\n"
+            "It takes a few seconds per object (about 2 s on a GTX 1050 Ti; up to 15 s when a "
+            "laptop GPU slows down because it is hot). This happens in the background, so "
+            "clicking goes on as usual: the preview shows the sharper outline once it is ready, "
+            "and pressing the main button waits for it.")
+        self.sharp.connect("toggled", lambda w: self.option_changed("sharp", w.get_active()))
+        grid.attach(self.sharp, 0, row[0], 2, 1)
+        row[0] += 1
+
         self.soft = Gtk.CheckButton(label="Soft edges (ViTMatte)")
         self.soft.set_active(self.options["soft"])
         self.soft.set_tooltip_text(
@@ -620,6 +640,7 @@ class AISelectDialog(Gtk.Dialog):
         self.fill_holes.set_value(d["fill_holes"])
         self.grow.set_value(d["grow"])
         self.feather.set_value(d["feather"])
+        self.sharp.set_active(d["sharp"])
         if self.soft_available:
             self.soft.set_active(d["soft"])
         self.output.set_active_id(d["output"])
@@ -1091,13 +1112,18 @@ class AISelectDialog(Gtk.Dialog):
 
     def render(self):
         """Fast preview right away; with Soft edges on, a soft-edge preview follows once
-        the clicks and options have been still for a moment."""
+        the clicks and options have been still for a moment. Sharper outlines are worked
+        out in the background: the preview shows the normal outline until they are ready
+        (see poll_sharp)."""
         self.area.queue_draw()  # show the new click marker right away
         self.select_button.set_sensitive(bool(self.objects))
         self.version += 1
         if self.soft_timer:
             GLib.source_remove(self.soft_timer)
             self.soft_timer = None
+        if self.sharp_timer:
+            GLib.source_remove(self.sharp_timer)
+            self.sharp_timer = None
         if not self.objects:
             self.overlay = None
             self.set_status("Click an object to select it.")
@@ -1105,8 +1131,33 @@ class AISelectDialog(Gtk.Dialog):
         version = self.version
         self.backend.request(self.preview_request(soft=False),
                              lambda reply: self.on_rendered(reply, version), coalesce="preview")
-        if self.options["soft"] and self.soft_available:
+        if self.soft_on():
             self.soft_timer = GLib.timeout_add(500, self.request_soft_preview, version)
+
+    def soft_on(self):
+        return self.options["soft"] and self.soft_available
+
+    def poll_sharp(self, version):
+        """While sharper outlines are worked out in the background, ask every 300 ms
+        whether they are ready; then show them (with soft edges, if those are on)."""
+        self.sharp_timer = None
+        if version != self.version:
+            return False
+
+        def on_status(reply):
+            if version != self.version or not reply.get("ok"):
+                return False
+            if reply["pending"]:
+                self.sharp_timer = GLib.timeout_add(300, self.poll_sharp, version)
+            elif self.soft_on():
+                self.request_soft_preview(version)
+            else:
+                self.backend.request(self.preview_request(soft=False),
+                                     lambda r: self.on_rendered(r, version), coalesce="preview")
+            return False
+
+        self.backend.request({"cmd": "sharp_status"}, on_status, coalesce="sharp_status")
+        return False
 
     def request_soft_preview(self, version):
         self.soft_timer = None
@@ -1153,15 +1204,26 @@ class AISelectDialog(Gtk.Dialog):
         clicks = len(self.objects) - boxes
         parts = [f"{clicks} click{'s' * (clicks != 1)}"] if clicks else []
         parts += [f"{boxes} box{'es' * (boxes != 1)}"] if boxes else []
+        shown, refining = [], []
+        if self.options["sharp"]:
+            if reply.get("sharp_pending"):
+                refining.append("sharper outlines")
+                if not self.sharp_timer:
+                    self.sharp_timer = GLib.timeout_add(300, self.poll_sharp, version)
+            elif reply.get("sharp_refined"):
+                shown.append("sharper outlines")
+            else:
+                parts.append("no sharper outline needed")
+        if self.soft_on():
+            (shown if soft else refining).append("soft edges")
         status = f"{pct:.1f}% of the image selected ({', '.join(parts)}"
-        if soft:
-            status += f", soft edges shown, {reply['seconds']:.1f} s)"
-            if not self.mask_button.get_active():
-                status += " - switch the view to Mask to see them"
-        elif self.options["soft"] and self.soft_available:
-            status += ") - refining soft edges..."
-        else:
-            status += f", {reply['seconds'] * 1000:.0f} ms)"
+        if shown:
+            status += f", {' and '.join(shown)} shown"
+        status += f", {reply['seconds']:.1f} s)" if soft else f", {reply['seconds'] * 1000:.0f} ms)"
+        if refining:
+            status += f" - refining {' and '.join(refining)}..."
+        elif soft and not self.mask_button.get_active():
+            status += " - switch the view to Mask to see the soft edges"
         self.set_status(status)
         self.area.queue_draw()
         return False
@@ -1280,15 +1342,25 @@ def export_selection(image, path):
 
 
 def export_visible(image, path):
+    """Write the visible image as raw 8-bit R'G'B'A (image size) and return the backend's
+    "load" fields for it. Raw rather than PNG: GIMP's PNG export compresses on one thread
+    and took 56 s for a noisy 4000x2600 photo, all of it before the window could appear;
+    this takes well under a second. The pixels are the ones the PNG had: the canvas area
+    (the merged layer can be smaller or offset; outside it is transparent) in the image's
+    own colour space, not converted to sRGB; and like the PNG export, fully transparent
+    pixels of an RGB or indexed image are black, while grayscale keeps their grey."""
     dup = image.duplicate()
-    dup.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
-    proc = Gimp.get_pdb().lookup_procedure("file-png-export")
-    config = proc.create_config()
-    config.set_property("run-mode", Gimp.RunMode.NONINTERACTIVE)
-    config.set_property("image", dup)
-    config.set_property("file", Gio.File.new_for_path(path))
-    proc.run(config)
+    layer = dup.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
+    w, h = dup.get_width(), dup.get_height()
+    _, ox, oy = layer.get_offsets()
+    fmt = Babl.get_name(Babl.format_with_space("R'G'B'A u8", layer.get_format()))
+    data = layer.get_buffer().get(Gegl.Rectangle.new(-ox, -oy, w, h), 1.0, fmt,
+                                  Gegl.AbyssPolicy.NONE)
     dup.delete()
+    with open(path, "wb") as f:
+        f.write(bytes(data))
+    return {"image": path, "width": w, "height": h,
+            "transparent_black": image.get_base_type() != Gimp.ImageBaseType.GRAY}
 
 
 def write_mask(drawable, data):
@@ -1448,8 +1520,7 @@ def ai_select_steps(procedure, run_mode, image, config):
     work = tempfile.mkdtemp(prefix="aiselect_")
     backend = None
     try:
-        image_png = os.path.join(work, "image.png")
-        export_visible(image, image_png)
+        image_load = export_visible(image, os.path.join(work, "image.raw"))
         size = (image.get_width(), image.get_height())
         psize = preview_size(*size)
         preview_png = os.path.join(work, "preview.png")
@@ -1466,7 +1537,7 @@ def ai_select_steps(procedure, run_mode, image, config):
             if has_selection:  # offered as a starting point in the window
                 guide_raw = os.path.join(work, "gimp_selection.raw")
                 export_selection(image, guide_raw)
-            dialog = AISelectDialog(backend, image_png, size, preview_png, psize, options,
+            dialog = AISelectDialog(backend, image_load, size, preview_png, psize, options,
                                     soft_available=soft_edges_available(settings),
                                     has_selection=has_selection, guide_raw=guide_raw)
             response = dialog.run()
@@ -1479,11 +1550,11 @@ def ai_select_steps(procedure, run_mode, image, config):
                 json.dump(options, f)
         else:  # scripted use: the clicks come as JSON in the "objects" argument
             objects = json.loads(config.get_property("objects") or "[]")
-            for key in ("threshold", "granularity", "grow", "feather", "soft", "operation", "output"):
+            for key in ("threshold", "granularity", "grow", "feather", "sharp", "soft", "operation", "output"):
                 options[key] = config.get_property(key)
             options["fill_holes"] = config.get_property("fill-holes")
-            reply = backend.call({"cmd": "load", "image": image_png, "preview": preview_png,
-                                  "preview_width": psize[0], "preview_height": psize[1]})
+            reply = backend.call(dict(image_load, cmd="load", preview=preview_png,
+                                      preview_width=psize[0], preview_height=psize[1]))
             if not reply["ok"]:
                 return reply["error"]
 
@@ -1551,6 +1622,8 @@ class AISelect(Gimp.PlugIn):
         procedure.add_int_argument("fill-holes", "Fill holes", "Fill enclosed holes up to this diameter (px); 0 = off", 0, 500, 0, rw)
         procedure.add_int_argument("grow", "Grow/shrink", "Pixels", -100, 100, 0, rw)
         procedure.add_int_argument("feather", "Feather", "Pixels", 0, 200, 0, rw)
+        procedure.add_boolean_argument("sharp", "Sharper outlines", "Look at each object again on a crop around it",
+                                       False, rw)
         procedure.add_boolean_argument("soft", "Soft edges", "ViTMatte soft edges", False, rw)
         procedure.add_string_argument("operation", "Operation", "replace, add, subtract or intersect",
                                       "replace", rw)

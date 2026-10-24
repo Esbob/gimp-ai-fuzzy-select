@@ -452,6 +452,23 @@ res["guide_areas"] = len(call(cmd="load", image=os.path.join(work, "input.png"),
                               preview_width=400, preview_height=300, guide=os.path.join(work, "lasso.raw"))["guide"]["prompts"])
 res["hover_outline"] = len(hover["polygons"]) > 0 and int((hard > 0.5).sum()) == hover["area"]
 res["grow_bigger"] = bool((final(click, grow=5) > 0.5).sum() > (hard > 0.5).sum())
+t0 = time.time()
+res["mae_sharp"] = float(np.abs(final(click, sharp=True) - true).mean())
+res["sharp_s"] = round(time.time() - t0, 1)
+# In the window, sharper outlines are worked out in the background: a preview comes back at
+# once with the work pending, a hover meanwhile is answered at once, and once ready the
+# preview uses it.
+box = [{"sign": 1, "box": [240, 140, 560, 460]}]
+t0 = time.time()
+first = call(cmd="render", objects=box, sharp=True, preview_out=os.path.join(work, "p3.png"))
+res["sharp_preview_ms"] = round(1000 * (time.time() - t0))
+res["sharp_pending_first"] = first["sharp_pending"]
+t0 = time.time(); call(cmd="hover", point=[400, 300]); res["sharp_hover_ms"] = round(1000 * (time.time() - t0))
+t0 = time.time()
+while call(cmd="sharp_status")["pending"] and time.time() - t0 < 120:
+    time.sleep(0.1)
+res["sharp_refined_after"] = call(cmd="render", objects=box, sharp=True,
+                                  preview_out=os.path.join(work, "p4.png"))["sharp_refined"]
 f = final(click, feather=10)
 res["feather_soft_px"] = int(((f > 0.02) & (f < 0.98)).sum())
 if soft:
@@ -529,13 +546,20 @@ import importlib.util, json, os, sys, time
 plugin, settings, image = sys.argv[1], json.loads(sys.argv[2]), sys.argv[3]
 spec = importlib.util.spec_from_file_location("aiselect", plugin)
 ai = importlib.util.module_from_spec(spec); spec.loader.exec_module(ai)
-from gi.repository import Gtk, Gdk
+from gi.repository import Gtk, Gdk, GdkPixbuf
+# The plugin hands the window raw 8-bit RGBA, as GIMP exports it (see export_visible)
+pb = GdkPixbuf.Pixbuf.new_from_file(image).add_alpha(False, 0, 0, 0)
+data, stride = pb.get_pixels(), pb.get_rowstride()
+image = os.path.join(os.path.dirname(image), "input.raw")
+with open(image, "wb") as f:
+    f.write(b"".join(data[y * stride:y * stride + 3200] for y in range(600)))
+image = {"image": image, "width": 800, "height": 600, "transparent_black": True}
 ai.AISelectDialog.maximize = lambda self: None
 ai.AISelectDialog.show_all = lambda self: None  # keep the real window off the screen
 res = {}
 backend = ai.Backend(settings)
 try:
-    dlg = ai.AISelectDialog(backend, image, (800, 600), os.path.join(os.path.dirname(image), "wp.png"),
+    dlg = ai.AISelectDialog(backend, image, (800, 600), os.path.join(os.path.dirname(image["image"]), "wp.png"),
                             ai.preview_size(800, 600), ai.DEFAULT_OPTIONS,
                             soft_available=ai.soft_edges_available(settings))
     box = dlg.get_child(); dlg.remove(box)
@@ -611,6 +635,11 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (r["mae_guide"] < 0.03, f"a rough GIMP selection finds the object inside it (error vs true alpha {r['mae_guide']:.4f})"),
         (r["guide_areas"] == 2, f"a GIMP selection with two separate areas gives one prompt each ({r['guide_areas']})"),
         (r["grow_bigger"], "grow enlarges the selection"),
+        (r["mae_sharp"] <= r["mae_click"] + 0.002,
+         f"sharper outlines work (error vs true alpha {r['mae_sharp']:.4f} vs {r['mae_click']:.4f}, {r['sharp_s']} s)"),
+        (r["sharp_pending_first"] == 1 and r["sharp_refined_after"] == 1 and r["sharp_hover_ms"] < 1500,
+         f"sharper outlines are worked out in the background (preview {r['sharp_preview_ms']} ms, "
+         f"hover meanwhile {r['sharp_hover_ms']} ms, then shown: {r['sharp_refined_after'] == 1})"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
     ]
     if soft:
