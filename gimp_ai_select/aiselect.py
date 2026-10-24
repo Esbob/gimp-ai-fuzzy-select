@@ -59,6 +59,13 @@ PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 DEFAULT_OPTIONS = {
     "output": "selection", "hover": True, "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
     "sharp": False, "soft": False, "edge": 4, "operation": "replace",
+    "model": "",  # "" = the installed default (aiselect_settings.json)
+}
+# SAM 2.1 models the installer can set up: dropdown text and tooltip. (On real photos large
+# picked whole objects more often; small analyses a photo 3x faster, 4x on a CPU.)
+MODEL_LABELS = {
+    "large": ("SAM 2.1 large", "best quality"),
+    "small": ("SAM 2.1 small", "faster"),
 }
 RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "sharp", "soft", "edge")
 # Result choices: dropdown text and the label of the dialog's main button.
@@ -289,7 +296,7 @@ class AISelectDialog(Gtk.Dialog):
     `zoom` is screen pixels per image pixel, as in GIMP."""
 
     def __init__(self, backend, image_load, image_size, preview_png, preview_size, options,
-                 soft_available=True, has_selection=True, guide_raw=None):
+                 soft_available=True, has_selection=True, guide_raw=None, models=()):
         super().__init__(title="AI Fuzzy Select", modal=True)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
         self.select_button = self.add_button("_Select", Gtk.ResponseType.OK)
@@ -298,6 +305,7 @@ class AISelectDialog(Gtk.Dialog):
         self.backend = backend
         self.image_size = image_size
         self.preview_size = preview_size
+        self.models = list(models)  # installed SAM2 models; a dropdown if more than one
         self.preview_png = preview_png
         self.options = dict(options)
         self.soft_available = soft_available
@@ -340,6 +348,9 @@ class AISelectDialog(Gtk.Dialog):
                     preview_height=preview_size[1])
         if guide_raw:
             load["guide"] = guide_raw  # GIMP's current selection, to start from
+        self.load_request = load
+        if self.options["model"]:
+            load = dict(load, model=self.options["model"])
         self.backend.request(load, self.on_loaded)
 
     # --- layout ---
@@ -491,6 +502,17 @@ class AISelectDialog(Gtk.Dialog):
             widget.set_width_chars(4)
             widget.connect("value-changed", lambda w: self.option_changed(key, w.get_value_as_int()))
             return widget
+
+        if len(self.models) > 1:
+            self.model = Gtk.ComboBoxText()
+            for key in self.models:
+                self.model.append(key, MODEL_LABELS.get(key, (key,))[0])
+            self.model.set_active_id(self.options["model"] or self.models[0])
+            self.model.connect("changed", lambda w: self.change_model(w.get_active_id()))
+            add_row("Model", self.model,
+                    "\n".join(f"{MODEL_LABELS[k][0]}: {MODEL_LABELS[k][1]}" for k in self.models
+                              if k in MODEL_LABELS)
+                    + "\n\nSwitching keeps your clicks.")
 
         self.granularity = Gtk.ComboBoxText()
         for key, text in [("auto", "Auto"), ("whole", "Whole object"), ("part", "Part"),
@@ -656,7 +678,9 @@ class AISelectDialog(Gtk.Dialog):
         self.output.set_active_id(d["output"])
         if self.has_selection:
             self.operation.set_active_id(d["operation"])
-        self.options.update(d, soft=d["soft"] and self.soft_available)
+        # (not the model: switching it analyses the image again)
+        self.options.update({k: v for k, v in d.items() if k != "model"},
+                            soft=d["soft"] and self.soft_available)
         self.set_status("Options reset to their defaults.")
 
     def on_output_changed(self, output):
@@ -1181,6 +1205,22 @@ class AISelectDialog(Gtk.Dialog):
                                  coalesce="soft")
         return False
 
+    def change_model(self, name):
+        """Analyse the image again with another SAM2 model, then redo the clicks with it."""
+        if not name or name == (self.options["model"] or self.models[0]) or not self.ready:
+            return
+        self.options["model"] = name
+        self.ready = False
+        self.clear_hover()
+        self.set_busy("Loading model and analysing image...")
+        self.backend.request(dict(self.load_request, model=name), self.on_model_loaded)
+
+    def on_model_loaded(self, reply):
+        self.on_loaded(reply)
+        if reply["ok"] and self.objects:
+            self.render()
+        return False
+
     def on_loaded(self, reply):
         if not reply["ok"]:
             self.set_busy("Could not analyse the image:\n\n" + reply["error"], error=True)
@@ -1188,8 +1228,9 @@ class AISelectDialog(Gtk.Dialog):
             return False
         self.set_busy(None)
         self.ready = True
-        how = ("image analysis reused" if reply.get("cached")
-               else f"analysed in {reply['seconds']} s")
+        model = MODEL_LABELS.get(reply.get("model"), (reply.get("model"),))[0]
+        how = (f"{model}, image analysis reused" if reply.get("cached")
+               else f"{model}, analysed in {reply['seconds']} s")
         hint = "Click an object to select it."
         self.guide = reply.get("guide")
         if self.guide:
@@ -1566,16 +1607,23 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
     # open it, as for a normal run.
     interactive = run_mode != Gimp.RunMode.NONINTERACTIVE
     options = dict(DEFAULT_OPTIONS, **load_json(OPTIONS_FILE, {}))
+    models = list(settings.get("models", {}))  # installed SAM2 models, the default first
+    if settings.get("model") in models:
+        models.insert(0, models.pop(models.index(settings["model"])))
+    if options["model"] not in models:  # e.g. removed by a reinstall
+        options["model"] = ""
     if not interactive:  # scripted use: the clicks come as JSON in the "objects" argument
         try:
             objects = json.loads(config.get_property("objects") or "[]")
         except ValueError as e:
             return f"The objects argument isn't valid JSON: {e}"
-        for key in ("threshold", "granularity", "grow", "feather", "sharp", "soft", "operation", "output"):
+        for key in ("threshold", "granularity", "grow", "feather", "sharp", "soft", "operation", "output",
+                    "model"):
             options[key] = config.get_property(key)
         options["fill_holes"] = config.get_property("fill-holes")
+        options["model"] = options["model"] or ""  # GIMP gives None for an unset string
         for key, allowed in (("granularity", GRANULARITIES), ("operation", tuple(OPERATIONS)),
-                             ("output", tuple(OUTPUTS))):
+                             ("output", tuple(OUTPUTS)), ("model", ("",) + tuple(models))):
             if options[key] not in allowed:
                 return f"Unknown {key} {options[key]!r}: use one of {', '.join(allowed)}."
     elif max(image.get_width(), image.get_height()) > MAX_WINDOW_SIDE:
@@ -1607,7 +1655,7 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
                 export_selection(image, guide_raw)
             dialog = AISelectDialog(backend, image_load, size, preview_png, psize, options,
                                     soft_available=soft_edges_available(settings),
-                                    has_selection=has_selection, guide_raw=guide_raw)
+                                    has_selection=has_selection, guide_raw=guide_raw, models=models)
             response = dialog.run()
             objects, options = dialog.objects, dialog.options
             dialog.destroy()
@@ -1624,7 +1672,8 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
                         "Run it again on the image as it is now.")
         else:
             reply = backend.call(dict(image_load, cmd="load", preview=preview_png,
-                                      preview_width=psize[0], preview_height=psize[1]))
+                                      preview_width=psize[0], preview_height=psize[1],
+                                      model=options["model"] or None))
             if not reply["ok"]:
                 return reply["error"]
 
@@ -1691,6 +1740,8 @@ class AISelect(Gimp.PlugIn):
         procedure.add_int_argument("fill-holes", "Fill holes", "Fill enclosed holes up to this diameter (px); 0 = off", 0, 500, 0, rw)
         procedure.add_int_argument("grow", "Grow/shrink", "Pixels", -100, 100, 0, rw)
         procedure.add_int_argument("feather", "Feather", "Pixels", 0, 200, 0, rw)
+        procedure.add_string_argument("model", "Model", "An installed SAM2 model (large or small); "
+                                      "empty = the default", "", rw)
         procedure.add_boolean_argument("sharp", "Sharper outlines", "Look at each object again on a crop around it",
                                        False, rw)
         procedure.add_boolean_argument("soft", "Soft edges", "ViTMatte soft edges", False, rw)

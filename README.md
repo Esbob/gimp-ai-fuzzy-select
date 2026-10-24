@@ -50,6 +50,7 @@ is held.
 
 | Option | What it does |
 |---|---|
+| Model | Shown when both models are installed: SAM 2.1 large (best quality) or SAM 2.1 small (about 3× faster, half the GPU memory). Switching analyses the image again; your clicks are kept |
 | Granularity | Auto, Whole object, Part or Detail: whether each click selects, adds or subtracts a whole object or a part of it (e.g. tree → crown → branch) |
 | Threshold | Like Fuzzy Select's threshold: higher selects more, lower selects less (50 = SAM 2's own cut-off) |
 | Fill holes | Fill holes in the selection up to this diameter in pixels, e.g. a window in a wall you want selected as solid. Only holes completely surrounded by the selection are filled, and SAM 2 already includes holes smaller than about 10 px. 0 (default) = off, keeps every hole (e.g. sky between branches) |
@@ -110,8 +111,9 @@ installer and uninstaller stop a running backend before changing its files.
   get PyTorch's CUDA 12.6 build and newer ones the CUDA 13 build, so the NVIDIA driver must
   support that CUDA version. Without an NVIDIA GPU everything runs on the CPU; this is
   untested and analysing the image will be much slower.
-- **Disk space:** about 6 GB (PyTorch and other packages 4.4 GB, SAM 2 checkpoint 0.9 GB,
-  ViTMatte checkpoint and code 0.5 GB). About 0.5 GB less with `--no-soft-edges`.
+- **Disk space:** about 6 GB (PyTorch and other packages 4.4 GB, SAM 2.1 large 0.9 GB,
+  ViTMatte checkpoint and code 0.5 GB). SAM 2.1 small is 0.2 GB; about 0.5 GB less with
+  `--no-soft-edges`.
 - **Internet access** during installation, to download the packages and checkpoints.
 - **Operating system:** tested on Windows 11 only. The installer contains code for Linux
   and macOS, but **it has not been tested on Linux or macOS**.
@@ -131,8 +133,9 @@ Useful options:
 
 | Option | Use |
 |---|---|
+| `--model large` / `--model small` | Which SAM 2.1 model to install; give it twice for both and switch in the window (the first is the default). Without it: large with an NVIDIA GPU, small without one |
 | `--no-soft-edges` | Install SAM 2 only (no ViTMatte); the Soft edges option is greyed out |
-| `--sam2-checkpoint PATH` | Use an already downloaded `sam2_hiera_large.pt` |
+| `--sam2-checkpoint PATH` | Use an already downloaded `sam2.1_hiera_large.pt` or `sam2.1_hiera_small.pt` |
 | `--vitmatte-checkpoint PATH` | Use an already downloaded `ViTMatte_B_DIS.pth` |
 | `--install-dir PATH` | Install somewhere else (keep the path short on Windows) |
 | `--gimp-plugins-dir PATH` | GIMP's plug-ins folder, if it isn't found automatically |
@@ -168,6 +171,6 @@ Co-authored with [Claude Code](https://claude.com/claude-code) (Claude Opus 5.5,
 This plug-in is MIT-licensed (see [LICENSE](LICENSE)). The installer downloads, at pinned
 versions:
 
-- [SAM 2](https://github.com/facebookresearch/sam2) and its checkpoint, by Meta (Apache 2.0)
+- [SAM 2](https://github.com/facebookresearch/sam2) and its SAM 2.1 checkpoints, by Meta (Apache 2.0)
 - ViTMatte code and checkpoint from [Matte Anything](https://github.com/hustvl/Matte-Anything) (MIT), for soft edges
 - [detectron2](https://github.com/facebookresearch/detectron2) by Meta (Apache 2.0), for loading ViTMatte

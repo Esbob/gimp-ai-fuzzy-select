@@ -7,7 +7,8 @@ result is a normal GIMP selection.
 What it does:
   1. Creates a virtual environment with the Python running this script (3.10-3.13).
   2. Installs a PyTorch build matching your GPU (CPU-only if there is none).
-  3. Installs SAM2 (pinned) and downloads its checkpoint.
+  3. Installs SAM2 (pinned) and downloads a SAM 2.1 model: large with an NVIDIA GPU,
+     small without one (--model chooses; give it twice for both).
   4. Optionally (default on) installs ViTMatte for the "Soft edges" option: detectron2
      and the ViTMatte code from Matte Anything are used as plain source, so no C++/CUDA
      compiler is needed.
@@ -18,7 +19,8 @@ What it does:
 Usage:
   python install_ai_select.py
   python install_ai_select.py --no-soft-edges          # lighter: SAM2 only
-  python install_ai_select.py --sam2-checkpoint sam2_hiera_large.pt   # reuse a download
+  python install_ai_select.py --model large --model small   # both, switch in the window
+  python install_ai_select.py --sam2-checkpoint sam2.1_hiera_large.pt   # reuse a download
   python install_ai_select.py --test-only
 
 Only the Python standard library is needed to run this script.
@@ -48,8 +50,14 @@ PLUGIN_FILES = ["aiselect.py", "aiselect_server.py"]
 # --- Pinned sources (tested together) ---------------------------------------------
 
 SAM2 = ("facebookresearch/sam2", "2b90b9f5ceec907a1c18123530e92e794ad901a4")
-SAM2_CHECKPOINT = ("sam2_hiera_large.pt",
-                   "https://dl.fbaipublicfiles.com/segment_anything_2/072824/sam2_hiera_large.pt")
+# The SAM 2.1 models on offer: name -> (config in the SAM2 source, checkpoint file, MB).
+# On real photos large picked whole objects more often; small analyses a photo about 3x
+# faster on a GPU (4x on a CPU) with half the GPU memory.
+MODELS = {
+    "large": ("configs/sam2.1/sam2.1_hiera_l.yaml", "sam2.1_hiera_large.pt", 900),
+    "small": ("configs/sam2.1/sam2.1_hiera_s.yaml", "sam2.1_hiera_small.pt", 185),
+}
+MODEL_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/{}"
 # Soft edges: ViTMatte's model code and config live in Matte Anything; its config system
 # is detectron2's LazyConfig.
 MATTE_ANYTHING = ("hustvl/Matte-Anything", "874951ac0b8d324ad9f885baf1c7de711b8dc1b0")
@@ -401,18 +409,22 @@ def install_soft_edges(py, src):
     return vitmatte
 
 
-def get_sam2_checkpoint(dest, existing):
-    if existing:
+def get_sam2_checkpoint(name, dest_dir, existing):
+    """The checkpoint of model `name`: `existing` if it is that model's file, else the one
+    in dest_dir, downloaded if needed."""
+    file = MODELS[name][1]
+    if existing and Path(existing).name == file:
         existing = Path(existing).resolve()
         if not existing.exists():
             raise InstallError(f"--sam2-checkpoint not found: {existing}")
         ok(f"Using existing SAM2 checkpoint: {existing}")
         return existing
+    dest = dest_dir / file
     if dest.exists():
         ok(f"Already present: {dest}")
     else:
-        info(f"Downloading {SAM2_CHECKPOINT[0]} (~900 MB)")
-        download(SAM2_CHECKPOINT[1], dest)
+        info(f"Downloading {file} (~{MODELS[name][2]} MB)")
+        download(MODEL_URL.format(file), dest)
     return dest
 
 
@@ -552,7 +564,7 @@ res["sharp_s"] = round(time.time() - t0, 1)
 # once with the work pending, a hover meanwhile is answered at once, and once ready the
 # preview uses it.
 box = [{"sign": 1, "box": [240, 140, 560, 460]}]
-t0 = time.time()
+t0 = t_refine = time.time()
 first = call(cmd="render", objects=box, sharp=True, preview_out=os.path.join(work, "p3.png"))
 res["sharp_preview_ms"] = round(1000 * (time.time() - t0))
 res["sharp_pending_first"] = first["sharp_pending"]
@@ -560,6 +572,7 @@ t0 = time.time(); call(cmd="hover", point=[400, 300]); res["sharp_hover_ms"] = r
 t0 = time.time()
 while call(cmd="sharp_status")["pending"] and time.time() - t0 < 120:
     time.sleep(0.1)
+res["sharp_refine_ms"] = round(1000 * (time.time() - t_refine))
 res["sharp_refined_after"] = call(cmd="render", objects=box, sharp=True,
                                   preview_out=os.path.join(work, "p4.png"))["sharp_refined"]
 f = final(click, feather=10)
@@ -569,6 +582,12 @@ if soft:
     s = final(click, soft=True)
     res["mae_soft"] = float(np.abs(s - true).mean())
     res["soft_s"] = round(time.time() - t0, 1)
+res["models"] = {}
+for name in json.loads(settings).get("models", {}):
+    t0 = time.time()
+    used = call(cmd="load", image=os.path.join(work, "input.png"), preview=os.path.join(work, "p.png"),
+                preview_width=400, preview_height=300, model=name)["model"]
+    res["models"][name] = [used, round(time.time() - t0, 1), float(np.abs(final(click) - true).mean())]
 call(cmd="quit"); proc.wait(timeout=30)
 print("RESULT " + json.dumps(res))
 """
@@ -693,8 +712,9 @@ res = {}
 backend = ai.Backend(settings)
 try:
     dlg = ai.AISelectDialog(backend, image, (800, 600), os.path.join(os.path.dirname(image["image"]), "wp.png"),
-                            ai.preview_size(800, 600), ai.DEFAULT_OPTIONS,
-                            soft_available=ai.soft_edges_available(settings))
+                            ai.preview_size(800, 600), dict(ai.DEFAULT_OPTIONS),
+                            soft_available=ai.soft_edges_available(settings),
+                            models=list(settings.get("models", {})))
     box = dlg.get_child(); dlg.remove(box)
     off = Gtk.OffscreenWindow(); off.set_size_request(1400, 900); off.add(box); off.show_all()
     dlg.set_busy("Loading model and analysing image...")
@@ -735,6 +755,14 @@ try:
     dlg.on_key(dlg, e.key)
     res["shift_cursor"] = dlg.area.get_window().get_cursor() is dlg.cursors.get("+")
     res["select_enabled"] = dlg.select_button.get_sensitive()
+    # Another model from the Model dropdown: the image is analysed again, the clicks kept
+    models = list(settings.get("models", {}))
+    if len(models) > 1:
+        before = len(dlg.objects)
+        dlg.set_status("waiting")
+        dlg.model.set_active_id(models[1])
+        pump(lambda: dlg.ready and "selected" in dlg.status.get_text(), 300)
+        res["model_switch"] = [dlg.options["model"], len(dlg.objects) == before, dlg.status.get_text()]
 except Exception:
     import traceback
     res["exception"] = traceback.format_exc()
@@ -770,13 +798,21 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (r["grow_bigger"], "grow enlarges the selection"),
         (r["mae_sharp"] <= r["mae_click"] + 0.002,
          f"sharper outlines work (error vs true alpha {r['mae_sharp']:.4f} vs {r['mae_click']:.4f}, {r['sharp_s']} s)"),
-        # (a hover takes longer on a CPU-only install, where the refinement uses every core)
+        # A hover during the refinement must not wait for it. (Both slow down together when
+        # a laptop GPU throttles from heat, and on a CPU-only install, where the refinement
+        # uses every core: compared with the refinement's own time, not a fixed limit.)
         (r["sharp_pending_first"] == 1 and r["sharp_refined_after"] == 1
-         and (r["sharp_hover_ms"] < 1500 or r["device"] == "cpu"),
+         and (r["sharp_hover_ms"] < 1500 or r["sharp_hover_ms"] < 0.5 * r["sharp_refine_ms"]
+              or r["device"] == "cpu"),
          f"sharper outlines are worked out in the background (preview {r['sharp_preview_ms']} ms, "
-         f"hover meanwhile {r['sharp_hover_ms']} ms, then shown: {r['sharp_refined_after'] == 1})"),
+         f"hover meanwhile {r['sharp_hover_ms']} ms while the refinement took {r['sharp_refine_ms']} ms, "
+         f"then shown: {r['sharp_refined_after'] == 1})"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
     ]
+    for name, (used, seconds, mae) in r.get("models", {}).items():
+        checks.append((used == name and mae < 0.03,
+                       f"model SAM 2.1 {name} loads and selects (error vs true alpha {mae:.4f}, "
+                       f"switched in {seconds} s)"))
     if soft:
         checks.append((r["mae_soft"] < r["mae_click"],
                        f"soft edges beat the hard mask ({r['mae_soft']:.4f} vs {r['mae_click']:.4f}, "
@@ -843,13 +879,15 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
         fail("The window test failed:")
         print(textwrap.indent(r["exception"].strip(), "      "))
         return False
+    switch = r.get("model_switch")
     passed = (r["sidebar_disabled_while_loading"] and r["ready"] and r["sidebar_enabled_after"]
               and "selected" in r["click"] and r["objects"] == [1, 1, -1] and bool(r["box_object"]) and "1 box" in r["box_drag"] and r["shift_cursor"]
-              and r["select_enabled"])
+              and r["select_enabled"] and (switch is None or (switch[1] and "selected" in switch[2])))
     (ok if passed else fail)(
         f"window: options disabled while loading {r['sidebar_disabled_while_loading']}, ready "
         f"{r['ready']}; click/Shift/Ctrl gave objects {r['objects']}; a drag made box {r['box_object']}; '+' cursor with Shift "
-        f"{r['shift_cursor']}; status: {r['ctrl_click']!r}")
+        f"{r['shift_cursor']}; status: {r['ctrl_click']!r}"
+        + (f"; switched to model {switch[0]}, clicks kept {switch[1]}: {switch[2]!r}" if switch else ""))
     return bool(passed)
 
 
@@ -890,7 +928,11 @@ def main():
     parser.add_argument("--gimp-plugins-dir", type=Path, help="GIMP 3 plug-ins folder (default: auto-detected)")
     parser.add_argument("--no-soft-edges", action="store_true",
                         help="skip ViTMatte (the 'Soft edges' option); SAM2 only")
-    parser.add_argument("--sam2-checkpoint", help="use this existing sam2_hiera_large.pt instead of downloading")
+    parser.add_argument("--model", action="append", choices=list(MODELS),
+                        help="SAM 2.1 model to install; give it twice for both (switch in the window). "
+                             "Default: large with an NVIDIA GPU, small without one. The first is the default")
+    parser.add_argument("--sam2-checkpoint", help="use this existing sam2.1_hiera_large.pt or sam2.1_hiera_small.pt "
+                                                  "instead of downloading it")
     parser.add_argument("--vitmatte-checkpoint", help="use this existing ViTMatte_B_DIS.pth instead of downloading")
     parser.add_argument("--cpu", action="store_true", help="force a CPU-only PyTorch")
     parser.add_argument("--torch-index", help="override the PyTorch wheel index, e.g. cu126, cu130, cpu")
@@ -916,6 +958,10 @@ def main():
         index = "cpu"
     else:
         index = choose_torch_index(gpu)
+    models = list(dict.fromkeys(args.model or ["large" if index.startswith("cu") else "small"]))
+    if args.sam2_checkpoint and Path(args.sam2_checkpoint).name not in [MODELS[m][1] for m in models]:
+        sys.exit(f"--sam2-checkpoint must be one of {', '.join(MODELS[m][1] for m in models)} "
+                 "(the file name says which model it is)")
     plugins_dir = args.gimp_plugins_dir or find_gimp_plugins_dir()
     if plugins_dir is None:
         sys.exit("No GIMP 3 user profile found. Start GIMP 3 once, or pass --gimp-plugins-dir.")
@@ -925,6 +971,7 @@ def main():
     info(f"Install dir : {install_dir}")
     info(f"GPU         : {f'{gpu[0]} (compute {gpu[1] or "unknown"}, driver {gpu[2]})' if gpu else 'none detected'}")
     info(f"PyTorch     : {index} wheels")
+    info(f"SAM2 models : SAM 2.1 {' and '.join(models)} (default {models[0]})")
     info(f"Soft edges  : {'yes (ViTMatte)' if soft else 'no'}")
     info(f"GIMP plugin : {plugins_dir / 'aiselect'}")
     info(f"GIMP tests  : {gimp_console or 'skipped (gimp-console not found)'}")
@@ -952,10 +999,16 @@ def main():
             py = create_venv(install_dir / "venv")
             step(f"Installing PyTorch ({index}) and SAM2")
             install_sam2(py, index, src)
-            step("Fetching the SAM2 checkpoint")
-            sam2_ckpt = get_sam2_checkpoint(install_dir / "checkpoints" / SAM2_CHECKPOINT[0],
-                                            args.sam2_checkpoint)
-            settings = {"pythonPath": str(py), "sam2Checkpoint": str(sam2_ckpt)}
+            step("Fetching the SAM2 checkpoints")
+            checkpoints = install_dir / "checkpoints"
+            installed = {m: get_sam2_checkpoint(m, checkpoints, args.sam2_checkpoint) for m in models}
+            # Models downloaded by an earlier run stay available in the window
+            for m, (_, file, _) in MODELS.items():
+                if m not in installed and (checkpoints / file).exists():
+                    installed[m] = checkpoints / file
+            settings = {"pythonPath": str(py), "model": models[0],
+                        "models": {m: {"config": MODELS[m][0], "checkpoint": str(path)}
+                                   for m, path in installed.items()}}
             if soft:
                 step("Installing ViTMatte for soft edges")
                 vitmatte_dir = install_soft_edges(py, src)

@@ -13,8 +13,10 @@ Two ways to run it:
 Protocol: one JSON object per line in each direction. In --listen mode a connection
 starts with {"cmd": "hello", "token": ...}.
   {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h,
-   "guide": raw}
-      encode the image (with "width" and "height", "image" is raw 8-bit RGBA instead, and
+   "guide": raw, "model": name}
+      encode the image with SAM2 model "model" (one of the settings' "models"; default:
+      the settings' "model"); the reply's "model" says which was used. (With "width" and
+      "height", "image" is raw 8-bit RGBA instead, and
       "transparent_black" blacks out the hidden colour of fully transparent pixels, as
       GIMP's PNG export does for RGB images); "preview" is where render writes its
       overlay. "guide": the user's GIMP selection (8-bit, image size); the reply's "guide"
@@ -90,6 +92,7 @@ class Server:
         self.settings = settings
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.predictor = None
+        self.model_name = None  # the SAM2 model loaded (see model_spec)
         self.vitmatte = None
         self.image = None
         # (granularity, points) or ("box", ...) -> (full-res logits, low-res logits), oldest
@@ -118,14 +121,30 @@ class Server:
 
     # --- models --------------------------------------------------------------------
 
-    def load_sam2(self):
+    def model_spec(self, name=None):
+        """(name, config, checkpoint) of the SAM2 model to use: `name` if the settings have
+        it, else the settings' default. Settings from before there was a choice name only a
+        SAM 2 large checkpoint."""
+        models = self.settings.get("models")
+        if not models:
+            return "sam2-large", "configs/sam2/sam2_hiera_l.yaml", self.settings["sam2Checkpoint"]
+        if name not in models:
+            name = self.settings.get("model") if self.settings.get("model") in models else next(iter(models))
+        return name, models[name]["config"], models[name]["checkpoint"]
+
+    def load_sam2(self, name=None):
+        """Load a SAM2 model in place of the current one (only one is kept in memory)."""
         from sam2.build_sam import build_sam2
         from sam2.sam2_image_predictor import SAM2ImagePredictor
 
-        model = build_sam2("configs/sam2/sam2_hiera_l.yaml", self.settings["sam2Checkpoint"],
-                           device=self.device)
+        name, config, checkpoint = self.model_spec(name)
+        self.predictor = self.crop_predictor = None  # free the old one first
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
+        model = build_sam2(config, checkpoint, device=self.device)
         self.predictor = SAM2ImagePredictor(model)
         self.crop_predictor = SAM2ImagePredictor(model)
+        self.model_name = name
 
     def load_vitmatte(self):
         from detectron2.checkpoint import DetectionCheckpointer
@@ -151,8 +170,9 @@ class Server:
 
     def cmd_load(self, req):
         t0 = time.time()
-        if self.predictor is None:
-            self.load_sam2()
+        name = self.model_spec(req.get("model"))[0]
+        if self.predictor is None or name != self.model_name:
+            self.load_sam2(name)
         if req.get("width"):  # raw 8-bit RGBA from the plugin
             rgba = np.fromfile(req["image"], np.uint8).reshape(req["height"], req["width"], 4)
             self.image = rgba[..., :3].copy()
@@ -171,7 +191,7 @@ class Server:
             self.sharp_jobs.clear()
             self.sharp_done.clear()
             self.sharp_merged.clear()
-        key = hashlib.sha1(self.image.tobytes()).hexdigest() + str(self.image.shape)
+        key = hashlib.sha1(self.image.tobytes()).hexdigest() + str(self.image.shape) + self.model_name
         cached = key in self.analysed
         if cached:
             self.analysed.move_to_end(key)
@@ -191,7 +211,7 @@ class Server:
                 self.analysed.popitem(last=False)
         h, w = self.image.shape[:2]
         reply = {"width": w, "height": h, "seconds": round(time.time() - t0, 2),
-                 "device": self.device, "cached": cached}
+                 "device": self.device, "cached": cached, "model": self.model_name}
         if req.get("guide"):
             reply["guide"] = self.guide_prompt(req["guide"])
         return reply

@@ -238,8 +238,9 @@ def main():
     for log_file in (Path(tempfile.gettempdir()) / "aiselect.log", SERVER_LOG):
         if log_file.exists():
             plan.append((log_file, "log file"))
-    for key in ("sam2Checkpoint", "vitmatteCheckpoint"):
-        ckpt = settings.get(key)
+    checkpoints = [settings.get("sam2Checkpoint"), settings.get("vitmatteCheckpoint")]
+    checkpoints += [m.get("checkpoint") for m in settings.get("models", {}).values()]
+    for ckpt in checkpoints:
         if ckpt and install_dir not in Path(ckpt).resolve().parents:
             keep_notes.append(f"{ckpt} (yours, passed to the installer)")
 
