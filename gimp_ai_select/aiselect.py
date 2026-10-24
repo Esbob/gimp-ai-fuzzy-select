@@ -6,9 +6,9 @@ An AI "fuzzy select": instead of growing a selection over similar colours, it se
 the object you click on, using SAM2. GIMP plugins can't receive clicks on the canvas, so
 the clicking happens in the plugin's own window, with a live preview:
 
-    click           select the object under the cursor
-    Shift+click     add the object (or part) under the cursor
-    Ctrl+click      subtract the object (or part) under the cursor
+    click / drag    select the object under the cursor / inside the dragged box
+    Shift+...       add the object (or part) under the cursor / inside the box
+    Ctrl+...        subtract the object (or part) under the cursor / inside the box
     Ctrl+Z          undo the last click     Ctrl+scroll: zoom
 
 Whether a click means a whole object or a part of it follows the Granularity option.
@@ -211,6 +211,7 @@ class AISelectDialog(Gtk.Dialog):
         self.version = 0  # bumped on every change; older preview results are discarded
         self.soft_timer = None
         self.pan_start = None
+        self.drag = None  # a left/right button press in progress: click or box
         self.cursors = {}
         self.modifiers = 0  # Shift/Ctrl currently held, for the cursor's +/- sign
 
@@ -320,7 +321,8 @@ class AISelectDialog(Gtk.Dialog):
         help_label.set_line_wrap(True)
         help_label.set_markup(
             "<b>Click</b> an object to select it\n"
-            "<b>Shift+click</b> add · <b>Ctrl+click</b> remove\n"
+            "<b>Drag</b> a box around an object\n"
+            "<b>Shift</b> add · <b>Ctrl</b> remove (click or drag)\n"
             "<b>Ctrl+Z</b> undo\n"
             "<b>Ctrl+scroll</b> or <b>+ − 1</b> zoom\n"
             "<b>Middle-drag</b> or scroll to pan")
@@ -593,9 +595,17 @@ class AISelectDialog(Gtk.Dialog):
             cr.get_source().set_filter(cairo.FILTER_GOOD if s < 1 else cairo.FILTER_BILINEAR)
             cr.paint()
             cr.restore()
-        # Click markers: green = include, red = exclude.
+        # Boxes and click markers: green = include, red = exclude.
         for obj in self.objects:
-            for x, y, label in obj["points"]:
+            if obj.get("box"):
+                x1, y1, x2, y2 = (v * self.zoom for v in obj["box"])
+                colour = (0.1, 0.75, 0.2) if obj["sign"] > 0 else (0.9, 0.15, 0.15)
+                for rgb, width in (((1, 1, 1), 3), (colour, 1.5)):
+                    cr.rectangle(x1, y1, x2 - x1, y2 - y1)
+                    cr.set_source_rgb(*rgb)
+                    cr.set_line_width(width)
+                    cr.stroke()
+            for x, y, label in obj.get("points", []):
                 include = label == 1 and obj["sign"] > 0
                 px, py = (x + 0.5) * self.zoom, (y + 0.5) * self.zoom
                 cr.arc(px, py, 6, 0, 6.2832)
@@ -604,6 +614,17 @@ class AISelectDialog(Gtk.Dialog):
                 cr.arc(px, py, 4, 0, 6.2832)
                 cr.set_source_rgb(0.1, 0.75, 0.2) if include else cr.set_source_rgb(0.9, 0.15, 0.15)
                 cr.fill()
+        if self.drag and self.drag["dragging"]:  # the box being dragged, as marching ants
+            (x1, y1), (x2, y2) = self.drag["start"], self.drag["end"]
+            cr.rectangle(min(x1, x2) * self.zoom, min(y1, y2) * self.zoom,
+                         abs(x2 - x1) * self.zoom, abs(y2 - y1) * self.zoom)
+            cr.set_line_width(1.5)
+            cr.set_source_rgb(0, 0, 0)
+            cr.stroke_preserve()
+            cr.set_dash([5, 5])
+            cr.set_source_rgb(1, 1, 1)
+            cr.stroke()
+            cr.set_dash([])
         return False
 
     def on_scroll(self, widget, event):
@@ -624,6 +645,12 @@ class AISelectDialog(Gtk.Dialog):
             return None
         return [int(x), int(y)]
 
+    def image_point_clamped(self, wx, wy):
+        """Like image_point, but kept inside the image (for box corners)."""
+        ox, oy = self.image_offset()
+        return (min(max((wx - ox) / self.zoom, 0.0), float(self.image_size[0])),
+                min(max((wy - oy) / self.zoom, 0.0), float(self.image_size[1])))
+
     def on_press(self, widget, event):
         if event.type != Gdk.EventType.BUTTON_PRESS:
             return False
@@ -637,15 +664,26 @@ class AISelectDialog(Gtk.Dialog):
         if not self.ready:
             self.set_status("Still analysing the image, one moment...")
             return True
-        point = self.image_point(event.x, event.y)
-        if point is None:
-            return True
-        shift = bool(event.state & Gdk.ModifierType.SHIFT_MASK)
-        ctrl = bool(event.state & Gdk.ModifierType.CONTROL_MASK) or event.button == 3
-        self.add_click(point, shift, ctrl)
+        # Decided on release: a press that doesn't move is a click, a drag is a box.
+        self.drag = {
+            "button": event.button, "widget": (event.x, event.y), "dragging": False,
+            "point": self.image_point(event.x, event.y),
+            "start": self.image_point_clamped(event.x, event.y),
+            "end": self.image_point_clamped(event.x, event.y),
+            "shift": bool(event.state & Gdk.ModifierType.SHIFT_MASK),
+            "ctrl": bool(event.state & Gdk.ModifierType.CONTROL_MASK) or event.button == 3,
+        }
         return True
 
     def on_motion(self, widget, event):
+        if self.drag is not None:
+            wx, wy = self.drag["widget"]
+            if abs(event.x - wx) > 4 or abs(event.y - wy) > 4:
+                self.drag["dragging"] = True
+            if self.drag["dragging"]:
+                self.drag["end"] = self.image_point_clamped(event.x, event.y)
+                self.area.queue_draw()
+            return True
         if self.pan_start is None:
             self.update_cursor(event.state)
             return False
@@ -659,23 +697,39 @@ class AISelectDialog(Gtk.Dialog):
             self.pan_start = None
             self.update_cursor(event.state)
             return True
-        return False
+        drag, self.drag = self.drag, None
+        if drag is None or event.button != drag["button"]:
+            return False
+        if drag["dragging"]:
+            (x1, y1), (x2, y2) = drag["start"], self.image_point_clamped(event.x, event.y)
+            box = [int(min(x1, x2)), int(min(y1, y2)),
+                   int(round(max(x1, x2))), int(round(max(y1, y2)))]
+            if box[2] - box[0] >= 2 and box[3] - box[1] >= 2:
+                self.add_prompt({"box": box}, drag["shift"], drag["ctrl"])
+            else:
+                self.area.queue_draw()  # too small to be a box: just clear the rubber band
+        elif drag["point"] is not None:
+            self.add_click(drag["point"], drag["shift"], drag["ctrl"])
+        return True
 
     # --- clicks ---
 
     def add_click(self, point, shift=False, ctrl=False):
-        """Like Fuzzy Select: a plain click starts over with the object under the cursor,
-        Shift adds the object (or part) under the cursor and Ctrl subtracts it. Each click
-        is its own SAM2 prompt; Granularity decides whether it means a whole object or a
-        part."""
+        self.add_prompt({"points": [point + [1]]}, shift, ctrl)
+
+    def add_prompt(self, prompt, shift=False, ctrl=False):
+        """Like Fuzzy Select: a plain click or box starts over with that object, Shift adds
+        it and Ctrl subtracts it. Each click or box is its own SAM2 prompt; for clicks,
+        Granularity decides whether it means a whole object or a part, while a box says
+        that itself."""
         if ctrl and not self.objects:
             return  # nothing to remove from
         self.history.append(copy.deepcopy(self.objects))
-        clicked = {"sign": -1 if ctrl else 1, "points": [point + [1]]}
+        new = dict(prompt, sign=-1 if ctrl else 1)
         if shift or ctrl:
-            self.objects.append(clicked)
+            self.objects.append(new)
         else:
-            self.objects = [clicked]
+            self.objects = [new]
         self.render()
 
     def undo(self):
@@ -834,8 +888,11 @@ class AISelectDialog(Gtk.Dialog):
         if stale:
             return False
         pct = 100 * reply["area"] / (self.image_size[0] * self.image_size[1])
-        clicks = sum(len(o["points"]) for o in self.objects)
-        status = f"{pct:.1f}% of the image selected ({clicks} click{'s' * (clicks != 1)}"
+        boxes = sum(1 for o in self.objects if o.get("box"))
+        clicks = len(self.objects) - boxes
+        parts = [f"{clicks} click{'s' * (clicks != 1)}"] if clicks else []
+        parts += [f"{boxes} box{'es' * (boxes != 1)}"] if boxes else []
+        status = f"{pct:.1f}% of the image selected ({', '.join(parts)}"
         if soft:
             status += f", soft edges shown, {reply['seconds']:.1f} s)"
             if not self.mask_button.get_active():

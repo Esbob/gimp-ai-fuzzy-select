@@ -10,7 +10,8 @@ Protocol: one JSON object per line on stdin, one JSON reply per line on stdout.
   {"cmd": "render", "objects": [...], "threshold": 0-100, "granularity": "auto"|"detail"|
    "part"|"whole", "fill_holes": px, "grow": px, "feather": px, "soft": false,
    "final": false, "soft_preview": false, "out": raw, "preview_out": png}
-      objects: [{"sign": 1 or -1, "points": [[x, y, label], ...]}, ...] in image pixels;
+      objects: [{"sign": 1 or -1, "points": [[x, y, label], ...]} or
+                {"sign": 1 or -1, "box": [x1, y1, x2, y2]}, ...] in image pixels;
       the selection is (union of sign 1 objects) minus (union of sign -1 objects).
       Not final: write a tinted preview overlay PNG with an outline to "preview_out"
       (with "soft" and "soft_preview": ViTMatte edges computed at reduced size;
@@ -141,6 +142,18 @@ class Server:
         self.cache[key] = (full, low)
         return full
 
+    def box_logits(self, box):
+        """Full-res mask logits for the object inside a dragged box [x1, y1, x2, y2]. SAM2
+        recommends a single output for box prompts: the box already says how big the
+        object is, so Granularity doesn't apply."""
+        key = ("box", tuple(box))
+        if key not in self.cache:
+            with torch.no_grad():
+                masks, _, low = self.predictor.predict(
+                    box=np.array(box, dtype=np.float32), multimask_output=False, return_logits=True)
+            self.cache[key] = (masks[0], low[0])
+        return self.cache[key][0]
+
     def selection(self, req):
         """Combined boolean mask, before grow/feather."""
         # Threshold 50 is SAM2's own cut-off (logit 0); 100 selects more, 0 less. The
@@ -152,10 +165,14 @@ class Server:
         sub = np.zeros((h, w), bool)
         granularity = req.get("granularity", "auto")
         for obj in req["objects"]:
-            points = obj["points"]
-            if not points:
+            points = obj.get("points", [])
+            if obj.get("box"):
+                mask = self.box_logits(obj["box"]) > cut
+                points = []  # a box object has no refinement clicks
+            elif points:
+                mask = self.object_logits(points, granularity) > cut
+            else:
                 continue
-            mask = self.object_logits(points, granularity) > cut
             # SAM2 sometimes ignores a refinement click (e.g. an "exclude" inside a uniform
             # object). Keep the Fuzzy Select promise anyway: a Shift-clicked spot ends up
             # selected and a Ctrl-clicked spot ends up deselected, by adding or removing

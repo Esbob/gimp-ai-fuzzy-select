@@ -11,20 +11,23 @@ out which pixels belong to it. The result is a normal GIMP selection with marchi
 compact options sidebar. GIMP plug-ins can't receive clicks on the canvas itself, so you
 click in this window; when you press **Select**, the result becomes GIMP's selection.
 
-### Clicking
+### Clicking and dragging
 
 | Action | Effect |
 |---|---|
 | Click | Select the object under the cursor (starts over) |
-| Shift+click | Add the object (or part) under the cursor |
-| Ctrl+click (or right-click) | Subtract the object (or part) under the cursor |
-| Ctrl+Z | Undo the last click |
+| Drag | Select the object inside the box you drag (starts over) |
+| Shift+click / Shift+drag | Add the object (or part) under the cursor / inside the box |
+| Ctrl+click / Ctrl+drag (or with the right button) | Subtract the object (or part) under the cursor / inside the box |
+| Ctrl+Z | Undo the last click or box |
 
-As with Fuzzy Select, each click picks out an object (or part) of its own, and Shift/Ctrl
-add it to or subtract it from what you have so far. Whether a click means the whole object
+As with Fuzzy Select, each click or box picks out an object (or part) of its own, and
+Shift/Ctrl add it to or subtract it from what you have so far. A box is often the most
+reliable way to get a thin or oddly shaped object that a single click doesn't capture. Whether a click means the whole object
 or a part of it follows the **Granularity** option: with *Auto* a click usually means the
 whole object, so to remove just a piece of an object with Ctrl+click, switch Granularity
-to *Part* or *Detail* first.
+to *Part* or *Detail* first. For a box, the box itself sets the size, so Granularity
+doesn't apply.
 
 The selection is previewed live as a tinted overlay with a dashed outline. The cursor looks
 like GIMP's Fuzzy Select cursor and shows **+** while Shift is held and **−** while Ctrl

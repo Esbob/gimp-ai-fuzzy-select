@@ -396,6 +396,7 @@ res["shift_adds_spot"] = bool(added[80, 700] > 0.5 and added[300, 400] > 0.5)
 removed = final([{"sign": 1, "points": [[700, 80, 1]]}, {"sign": 1, "points": [[400, 300, 1]]},
                  {"sign": -1, "points": [[400, 250, 1]]}])
 res["ctrl_removes_spot"] = bool(removed[250, 400] < 0.5 and removed[80, 700] > 0.5)
+res["mae_box"] = float(np.abs(final([{"sign": 1, "box": [240, 140, 560, 460]}]) - true).mean())
 res["grow_bigger"] = bool((final(click, grow=5) > 0.5).sum() > (hard > 0.5).sum())
 f = final(click, feather=10)
 res["feather_soft_px"] = int(((f > 0.02) & (f < 0.98)).sum())
@@ -475,17 +476,29 @@ try:
     res["sidebar_disabled_while_loading"] = not dlg.sidebar.get_sensitive()
     res["ready"] = pump(lambda: dlg.ready, 300)
     res["sidebar_enabled_after"] = dlg.sidebar.get_sensitive()
-    def click(x, y, state=0):
-        ev = Gdk.Event.new(Gdk.EventType.BUTTON_PRESS); b = ev.button
-        ox, oy = dlg.image_offset()
-        b.button = 1; b.x = ox + (x + .5) * dlg.zoom; b.y = oy + (y + .5) * dlg.zoom; b.state = state
-        dlg.set_status("waiting"); dlg.on_press(dlg.area, b)
+    def mouse(kind, x, y, state=0):
+        ev = Gdk.Event.new(kind); ox, oy = dlg.image_offset()
+        e = ev.motion if kind == Gdk.EventType.MOTION_NOTIFY else ev.button
+        if kind != Gdk.EventType.MOTION_NOTIFY:
+            e.button = 1
+        e.x = ox + (x + .5) * dlg.zoom; e.y = oy + (y + .5) * dlg.zoom; e.state = state
+        handler = {Gdk.EventType.BUTTON_PRESS: dlg.on_press, Gdk.EventType.MOTION_NOTIFY: dlg.on_motion,
+                   Gdk.EventType.BUTTON_RELEASE: dlg.on_release}[kind]
+        handler(dlg.area, e)
+    def click(x, y, state=0, drag_to=None):
+        dlg.set_status("waiting")
+        mouse(Gdk.EventType.BUTTON_PRESS, x, y, state)
+        if drag_to:
+            mouse(Gdk.EventType.MOTION_NOTIFY, *drag_to, state)
+        mouse(Gdk.EventType.BUTTON_RELEASE, *(drag_to or (x, y)), state)
         pump(lambda: "selected" in dlg.status.get_text(), 30)
         return dlg.status.get_text()
     res["click"] = click(400, 300)
     res["shift_click"] = click(700, 80, Gdk.ModifierType.SHIFT_MASK)
     res["ctrl_click"] = click(400, 250, Gdk.ModifierType.CONTROL_MASK)
     res["objects"] = [o["sign"] for o in dlg.objects]
+    res["box_drag"] = click(240, 140, 0, (560, 460))
+    res["box_object"] = dlg.objects[-1].get("box") if dlg.objects else None
     e = Gdk.Event.new(Gdk.EventType.KEY_PRESS); e.key.keyval = Gdk.KEY_Shift_L; e.key.state = 0
     dlg.on_key(dlg, e.key)
     res["shift_cursor"] = dlg.area.get_window().get_cursor() is dlg.cursors.get("+")
@@ -518,6 +531,7 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
          f"higher threshold selects more {r['threshold_areas']}"),
         (r["shift_adds_spot"], "Shift+click adds the clicked object, keeping the first"),
         (r["ctrl_removes_spot"], "Ctrl+click subtracts the clicked object, keeping the rest"),
+        (r["mae_box"] < 0.03, f"a box around the object selects it (error vs true alpha {r['mae_box']:.4f})"),
         (r["grow_bigger"], "grow enlarges the selection"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
     ]
@@ -579,11 +593,11 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
         print(textwrap.indent(r["exception"].strip(), "      "))
         return False
     passed = (r["sidebar_disabled_while_loading"] and r["ready"] and r["sidebar_enabled_after"]
-              and "selected" in r["click"] and r["objects"] == [1, 1, -1] and r["shift_cursor"]
+              and "selected" in r["click"] and r["objects"] == [1, 1, -1] and bool(r["box_object"]) and "1 box" in r["box_drag"] and r["shift_cursor"]
               and r["select_enabled"])
     (ok if passed else fail)(
         f"window: options disabled while loading {r['sidebar_disabled_while_loading']}, ready "
-        f"{r['ready']}; click/Shift/Ctrl gave objects {r['objects']}; '+' cursor with Shift "
+        f"{r['ready']}; click/Shift/Ctrl gave objects {r['objects']}; a drag made box {r['box_object']}; '+' cursor with Shift "
         f"{r['shift_cursor']}; status: {r['ctrl_click']!r}")
     return bool(passed)
 
