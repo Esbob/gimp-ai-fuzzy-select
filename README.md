@@ -40,7 +40,7 @@ is held.
 | Grow/shrink | Grow or shrink the selection, in pixels |
 | Feather | Soften the selection edge, in pixels |
 | Soft edges (ViTMatte) | Refine fuzzy edges such as hair and foliage into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte); applied when you press Select |
-| On Select | Replace, add to, subtract from or intersect with GIMP's current selection |
+| Existing selection in GIMP | Only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
 Your options are remembered between runs.
 

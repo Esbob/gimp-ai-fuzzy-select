@@ -182,7 +182,7 @@ class AISelectDialog(Gtk.Dialog):
     `zoom` is screen pixels per image pixel, as in GIMP."""
 
     def __init__(self, backend, image_png, image_size, preview_png, preview_size, options,
-                 soft_available=True):
+                 soft_available=True, has_selection=True):
         super().__init__(title="AI Fuzzy Select", modal=True)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
         self.select_button = self.add_button("_Select", Gtk.ResponseType.OK)
@@ -194,6 +194,7 @@ class AISelectDialog(Gtk.Dialog):
         self.preview_png = preview_png
         self.options = dict(options)
         self.soft_available = soft_available
+        self.has_selection = has_selection  # the image already has a selection to combine with
         if not soft_available:
             self.options["soft"] = False
         self.objects = []  # the backend's prompt: [{"sign": 1/-1, "points": [[x, y, label]]}]
@@ -391,14 +392,20 @@ class AISelectDialog(Gtk.Dialog):
         grid.attach(self.soft, 0, row[0], 2, 1)
         row[0] += 1
 
-        heading("On Select")
-        self.operation = Gtk.ComboBoxText()
-        for key, text in [("replace", "Replace selection"), ("add", "Add to selection"),
-                          ("subtract", "Subtract from selection"), ("intersect", "Intersect with selection")]:
-            self.operation.append(key, text)
-        self.operation.set_active_id(self.options["operation"])
-        self.operation.connect("changed", lambda w: self.options.update(operation=w.get_active_id()))
-        side.pack_start(self.operation, False, False, 0)
+        # How to combine with GIMP's existing selection: only meaningful if there is one.
+        if self.has_selection:
+            heading("Existing selection in GIMP")
+            self.operation = Gtk.ComboBoxText()
+            for key, text in [("replace", "Replace it"), ("add", "Add to it"),
+                              ("subtract", "Subtract from it"), ("intersect", "Intersect with it")]:
+                self.operation.append(key, text)
+            self.operation.set_active_id(self.options["operation"])
+            self.operation.set_tooltip_text(
+                "Your image in GIMP already has a selection. When you press the Select button, the AI "
+                "selection replaces it, is added to it, is subtracted from it, or keeps only "
+                "where the two overlap")
+            self.operation.connect("changed", lambda w: self.options.update(operation=w.get_active_id()))
+            side.pack_start(self.operation, False, False, 0)
 
         self.status = Gtk.Label(xalign=0)
         self.status.set_line_wrap(True)
@@ -983,11 +990,15 @@ def ai_select_steps(procedure, run_mode, image, config):
         psize = preview_size(*size)
         preview_png = os.path.join(work, "preview.png")
         backend = Backend(settings)
+        # Without an existing selection, "Existing selection in GIMP" is hidden and the result simply
+        # becomes the selection; the remembered choice is kept for next time.
+        has_selection = Gimp.Selection.bounds(image)[1]
 
         if run_mode == Gimp.RunMode.INTERACTIVE:
             GimpUi.init("aiselect")
             dialog = AISelectDialog(backend, image_png, size, preview_png, psize, options,
-                                    soft_available=soft_edges_available(settings))
+                                    soft_available=soft_edges_available(settings),
+                                    has_selection=has_selection)
             response = dialog.run()
             objects, options = dialog.objects, dialog.options
             dialog.destroy()
@@ -1020,10 +1031,12 @@ def ai_select_steps(procedure, run_mode, image, config):
             return "The selection came out empty (try a higher Threshold or another click)."
         image.undo_group_start()
         try:
-            apply_selection(image, out, options["operation"])
+            interactive = run_mode == Gimp.RunMode.INTERACTIVE
+            operation = options["operation"] if has_selection or not interactive else "replace"
+            apply_selection(image, out, operation)
         finally:
             image.undo_group_end()
-        log(f"applied ({options['operation']}): {selection_summary(image)}")
+        log(f"applied ({operation}): {selection_summary(image)}")
         Gimp.displays_flush()
         return None
     finally:
