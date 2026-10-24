@@ -1,6 +1,6 @@
 # gimp-ai-fuzzy-select
 
-An AI-based fuzzy select tool for GIMP 3. It works like GIMP's **Fuzzy Select**, but it
+An AI-based fuzzy select tool for [GIMP](https://www.gimp.org/) 3. It works like GIMP's **Fuzzy Select**, but it
 selects by *object* instead of by *colour*: click on something in the image and
 [SAM 2](https://github.com/facebookresearch/sam2) (Meta's Segment Anything Model 2) works
 out which pixels belong to it. The result is a normal GIMP selection with marching ants.
