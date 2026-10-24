@@ -29,6 +29,7 @@ import shutil
 import signal
 import socket
 import stat
+import subprocess
 import sys
 import tempfile
 import time
@@ -40,6 +41,31 @@ PLUGIN_FOLDER = "aiselect"
 
 SERVER_STATE = Path(tempfile.gettempdir()) / "aiselect_server.json"
 SERVER_LOG = Path(tempfile.gettempdir()) / "aiselect_server.log"
+
+
+def process_start(pid):
+    """When process `pid` started, as a string, or None if unknown (computed the same way
+    as in aiselect_server.py, which writes its own to the state file)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if not k.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                    return None
+                return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+            finally:
+                k.CloseHandle(handle)
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
 
 
 def stop_backend():
@@ -60,12 +86,21 @@ def stop_backend():
             stopped = True
     except (OSError, KeyError, ValueError):
         pass
-    if not stopped and state.get("pid"):
-        try:  # not answering: end the process
-            os.kill(state["pid"], signal.SIGTERM)
-            stopped = True
-        except OSError:
-            pass
+    pid = state.get("pid")
+    if not stopped and pid:
+        # Not answering: end it, but only if that pid is still the backend that wrote the
+        # state file (same start time). After a crash or reboot the pid may belong to
+        # another program by now.
+        started = state.get("started")
+        if started and process_start(pid) == started:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stopped = True
+            except OSError:
+                pass
+        elif process_start(pid) is not None:
+            print(f"    Note: the backend didn't answer and process {pid} can't be confirmed to be it; "
+                  "left running. If it is a stuck AI Fuzzy Select backend, end it in Task Manager.")
     time.sleep(1)  # let it exit and release its files
     try:
         SERVER_STATE.unlink()

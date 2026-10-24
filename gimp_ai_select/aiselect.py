@@ -110,6 +110,7 @@ class Backend:
     def __init__(self, settings):
         self.settings = settings
         self.sock = self.rfile = self.wfile = None
+        self.last_load = None  # sent again if the server had to be restarted meanwhile
         self.queue = []
         self.cond = threading.Condition()
         self.next_id = 0
@@ -130,12 +131,13 @@ class Backend:
     def _try(self, state):
         try:
             sock = socket.create_connection(("127.0.0.1", state["port"]), timeout=3)
-            sock.settimeout(None)
+            sock.settimeout(10)  # a server stuck on another connection mustn't hang us
             self.sock = sock
             self.rfile = sock.makefile("r", encoding="utf-8", newline="\n")
             self.wfile = sock.makefile("w", encoding="utf-8", newline="\n")
             reply = self._send({"cmd": "hello", "token": state["token"]})
             if reply and reply.get("ok"):
+                sock.settimeout(None)  # requests can take long (a final render, a big image)
                 return True
         except (OSError, KeyError, ValueError):
             pass
@@ -216,8 +218,16 @@ class Backend:
             try:
                 if self.sock is None and req.get("cmd") not in ("bye", "quit"):
                     self._connect()
+                    if self.last_load and req.get("cmd") != "load":
+                        # A new connection after a lost one: the server may be a fresh one
+                        # that has never seen the image (a cached one answers at once).
+                        again = self._send(self.last_load)
+                        if not (again and again.get("ok")):
+                            raise RuntimeError("The image couldn't be sent to the restarted backend.")
                 if self.sock is not None:
                     reply = self._send(req)
+                    if req.get("cmd") == "load" and reply and reply.get("ok"):
+                        self.last_load = req
                 elif req.get("cmd") in ("bye", "quit"):
                     reply = {"ok": True}
             except RuntimeError as e:
@@ -1024,7 +1034,10 @@ class AISelectDialog(Gtk.Dialog):
         ctrl = event.state & Gdk.ModifierType.CONTROL_MASK
         shift = event.state & Gdk.ModifierType.SHIFT_MASK
         key = event.keyval
-        if ctrl and key in (Gdk.KEY_z, Gdk.KEY_Z):
+        if key == Gdk.KEY_Escape and self.drag is not None:
+            self.drag = None  # cancel the box being dragged, as in GIMP (not the window)
+            self.area.queue_draw()
+        elif ctrl and key in (Gdk.KEY_z, Gdk.KEY_Z):
             self.undo()
         elif ctrl and shift and key in (Gdk.KEY_j, Gdk.KEY_J):
             self.zoom_fit()
@@ -1077,7 +1090,8 @@ class AISelectDialog(Gtk.Dialog):
         if reply.get("ok") and self.hover_target is not None and self.options["hover"]:
             self.hover_polygons = reply["polygons"]
             self.area.queue_draw()
-        if self.hover_target is not None and self.hover_target != reply.get("point"):
+        # (after an error, wait for the mouse to move instead of asking again at once)
+        if reply.get("ok") and self.hover_target is not None and self.hover_target != reply.get("point"):
             self.hover_at(self.hover_target)  # the mouse moved on meanwhile
         return False
 
@@ -1210,6 +1224,9 @@ class AISelectDialog(Gtk.Dialog):
                 refining.append("sharper outlines")
                 if not self.sharp_timer:
                     self.sharp_timer = GLib.timeout_add(300, self.poll_sharp, version)
+                if self.soft_timer:  # soft edges would be worked out on the outline about to
+                    GLib.source_remove(self.soft_timer)  # change; poll_sharp asks for them later
+                    self.soft_timer = None
             elif reply.get("sharp_refined"):
                 shown.append("sharper outlines")
             else:
@@ -1348,15 +1365,20 @@ def export_visible(image, path):
     this takes well under a second. The pixels are the ones the PNG had: the canvas area
     (the merged layer can be smaller or offset; outside it is transparent) in the image's
     own colour space, not converted to sRGB; and like the PNG export, fully transparent
-    pixels of an RGB or indexed image are black, while grayscale keeps their grey."""
+    pixels of an RGB or indexed image are black, while grayscale keeps their grey.
+    Returns None if no layer is visible."""
     dup = image.duplicate()
-    layer = dup.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
-    w, h = dup.get_width(), dup.get_height()
-    _, ox, oy = layer.get_offsets()
-    fmt = Babl.get_name(Babl.format_with_space("R'G'B'A u8", layer.get_format()))
-    data = layer.get_buffer().get(Gegl.Rectangle.new(-ox, -oy, w, h), 1.0, fmt,
-                                  Gegl.AbyssPolicy.NONE)
-    dup.delete()
+    try:
+        layer = dup.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
+        if layer is None:  # no visible layers
+            return None
+        w, h = dup.get_width(), dup.get_height()
+        _, ox, oy = layer.get_offsets()
+        fmt = Babl.get_name(Babl.format_with_space("R'G'B'A u8", layer.get_format()))
+        data = layer.get_buffer().get(Gegl.Rectangle.new(-ox, -oy, w, h), 1.0, fmt,
+                                      Gegl.AbyssPolicy.NONE)
+    finally:
+        dup.delete()
     with open(path, "wb") as f:
         f.write(bytes(data))
     return {"image": path, "width": w, "height": h,
@@ -1365,7 +1387,10 @@ def export_visible(image, path):
 
 def write_mask(drawable, data):
     """Write 8-bit values into a channel or layer mask the drawable's size, in its own colour
-    model so 50% stays 50% ("Y u8" into a Y' channel would gamma-convert partial values)."""
+    model so 50% stays 50% ("Y u8" into a Y' channel would gamma-convert partial values).
+    Writing the buffer isn't an undo step, so only write into a channel or mask just made:
+    undoing its creation removes it. (The shadow buffer would be undoable, but merging it
+    only covers GIMP's current selection.)"""
     w, h = drawable.get_width(), drawable.get_height()
     fmt = "Y' u8" if Babl.get_name(drawable.get_format()).startswith("Y'") else "Y u8"
     buffer = drawable.get_buffer()
@@ -1440,10 +1465,17 @@ def apply_result(image, raw_file, output, operation, layer):
             image.insert_channel(channel, None, 0)
             write_mask(channel, data)
     elif output in ("layer", "cutout"):
+        locked = False
         if layer is not None:  # a copy of the current layer, right above it
             new = layer.copy()
             new.set_name(f"{layer.get_name()} (AI Fuzzy Select)")
             image.insert_layer(new, layer.get_parent(), image.get_item_position(layer))
+            # The copy keeps "Lock pixels", and GIMP ends a plug-in that writes to a locked
+            # layer or its mask: unlock the copy (it's ours) and lock it again afterwards.
+            locked = new.get_lock_content()
+            new.set_lock_content(False)
+            if output == "cutout" and new.is_group():
+                new = new.merge()  # a group's mask can't be applied; its merged copy's can
         else:  # no layer selected: what's visible
             new = Gimp.Layer.new_from_visible(image, image, "AI Fuzzy Select")
             image.insert_layer(new, None, 0)
@@ -1456,15 +1488,25 @@ def apply_result(image, raw_file, output, operation, layer):
             if not new.has_alpha():
                 new.add_alpha()
             new.remove_mask(Gimp.MaskApplyMode.APPLY)
+        new.set_lock_content(locked)
         image.set_selected_layers([new])
     elif output == "mask":
         if layer is None:
             return "Select a layer first: \"Mask on current layer\" needs one."
-        mask = layer.get_mask()  # an existing mask gets the new contents
-        if mask is None:
-            mask = layer.create_mask(Gimp.AddMaskType.WHITE)
-            layer.add_mask(mask)
+        if layer.get_lock_content():
+            return (f"The layer \"{layer.get_name()}\" has Lock pixels on, which also locks its "
+                    "mask: unlock it first.")
+        old = layer.get_mask()
+        flags = (layer.get_apply_mask(), layer.get_show_mask(), layer.get_edit_mask()) if old else None
+        if old is not None:  # replaced by a new mask, so Ctrl+Z brings the old one back
+            layer.remove_mask(Gimp.MaskApplyMode.DISCARD)
+        mask = layer.create_mask(Gimp.AddMaskType.WHITE)
+        layer.add_mask(mask)
         write_mask(mask, crop_to_layer(data, w, h, layer))
+        if flags:
+            layer.set_apply_mask(flags[0])
+            layer.set_show_mask(flags[1])
+            layer.set_edit_mask(flags[2])
     return None
 
 
@@ -1490,7 +1532,7 @@ def selection_summary(image):
     return f"non_empty={non_empty} bounds=({x1},{y1})-({x2},{y2})"
 
 
-def ai_select(procedure, run_mode, image, config):
+def ai_select(procedure, run_mode, image, drawables, config):
     """Returns an error message, or None."""
     try:
         open(LOG_FILE, "w").close()
@@ -1499,7 +1541,7 @@ def ai_select(procedure, run_mode, image, config):
     log(f"run_mode={run_mode} image={image.get_width()}x{image.get_height()} "
         f"precision={image.get_precision().value_nick} selection before: {selection_summary(image)}")
     try:
-        error = ai_select_steps(procedure, run_mode, image, config)
+        error = ai_select_steps(procedure, run_mode, image, drawables, config)
     except Exception:
         import traceback
         log("EXCEPTION\n" + traceback.format_exc())
@@ -1512,15 +1554,39 @@ def soft_edges_available(settings):
     return bool(settings.get("vitmatteDir") or settings.get("appDir"))
 
 
-def ai_select_steps(procedure, run_mode, image, config):
+GRANULARITIES = ("auto", "detail", "part", "whole")
+MAX_WINDOW_SIDE = 32767  # cairo, which draws the window's image, can't go larger
+
+
+def ai_select_steps(procedure, run_mode, image, drawables, config):
     settings = load_json(SETTINGS_FILE, None)
     if not settings:
         return "AI Fuzzy Select isn't set up. Run install_ai_select.py."
+    # Filters > Repeat Last runs with last values, but the clicks are made in the window:
+    # open it, as for a normal run.
+    interactive = run_mode != Gimp.RunMode.NONINTERACTIVE
     options = dict(DEFAULT_OPTIONS, **load_json(OPTIONS_FILE, {}))
+    if not interactive:  # scripted use: the clicks come as JSON in the "objects" argument
+        try:
+            objects = json.loads(config.get_property("objects") or "[]")
+        except ValueError as e:
+            return f"The objects argument isn't valid JSON: {e}"
+        for key in ("threshold", "granularity", "grow", "feather", "sharp", "soft", "operation", "output"):
+            options[key] = config.get_property(key)
+        options["fill_holes"] = config.get_property("fill-holes")
+        for key, allowed in (("granularity", GRANULARITIES), ("operation", tuple(OPERATIONS)),
+                             ("output", tuple(OUTPUTS))):
+            if options[key] not in allowed:
+                return f"Unknown {key} {options[key]!r}: use one of {', '.join(allowed)}."
+    elif max(image.get_width(), image.get_height()) > MAX_WINDOW_SIDE:
+        return (f"The window can't show images wider or taller than {MAX_WINDOW_SIDE} px. "
+                "Scale the image down, or use AI Fuzzy Select from a script.")
     work = tempfile.mkdtemp(prefix="aiselect_")
     backend = None
     try:
         image_load = export_visible(image, os.path.join(work, "image.raw"))
+        if image_load is None:
+            return "Nothing is visible in this image: show at least one layer, then try again."
         size = (image.get_width(), image.get_height())
         psize = preview_size(*size)
         preview_png = os.path.join(work, "preview.png")
@@ -1530,8 +1596,10 @@ def ai_select_steps(procedure, run_mode, image, config):
         has_selection = Gimp.Selection.bounds(image)[1]
         selected_layers = image.get_selected_layers()
         layer = selected_layers[0] if selected_layers else None  # for "layer"/"mask" results
+        if not interactive and drawables:  # a script names the drawable to work on
+            layer = next((d for d in drawables if isinstance(d, Gimp.Layer)), layer)
 
-        if run_mode == Gimp.RunMode.INTERACTIVE:
+        if interactive:
             GimpUi.init("aiselect")
             guide_raw = None
             if has_selection:  # offered as a starting point in the window
@@ -1548,11 +1616,13 @@ def ai_select_steps(procedure, run_mode, image, config):
                 return None
             with open(OPTIONS_FILE, "w", encoding="utf-8") as f:
                 json.dump(options, f)
-        else:  # scripted use: the clicks come as JSON in the "objects" argument
-            objects = json.loads(config.get_property("objects") or "[]")
-            for key in ("threshold", "granularity", "grow", "feather", "sharp", "soft", "operation", "output"):
-                options[key] = config.get_property(key)
-            options["fill_holes"] = config.get_property("fill-holes")
+            # GIMP stays usable while the window is open: the clicks were made on the image
+            # as it was then.
+            if (not image.is_valid() or (image.get_width(), image.get_height()) != size
+                    or (layer is not None and not layer.is_valid())):
+                return ("The image or its layers changed while AI Fuzzy Select was open. "
+                        "Run it again on the image as it is now.")
+        else:
             reply = backend.call(dict(image_load, cmd="load", preview=preview_png,
                                       preview_width=psize[0], preview_height=psize[1]))
             if not reply["ok"]:
@@ -1575,7 +1645,6 @@ def ai_select_steps(procedure, run_mode, image, config):
             return f"Unknown result type {output!r}."
         image.undo_group_start()
         try:
-            interactive = run_mode == Gimp.RunMode.INTERACTIVE
             operation = options["operation"] if has_selection or not interactive else "replace"
             error = apply_result(image, out, output, operation, layer)
         finally:
@@ -1632,9 +1701,9 @@ class AISelect(Gimp.PlugIn):
         return procedure
 
     def run(self, procedure, run_mode, image, drawables, config, data):
-        error = ai_select(procedure, run_mode, image, config)
+        error = ai_select(procedure, run_mode, image, drawables, config)
         if error:
-            if run_mode == Gimp.RunMode.INTERACTIVE:
+            if run_mode != Gimp.RunMode.NONINTERACTIVE:
                 Gimp.message(error)
             return procedure.new_return_values(Gimp.PDBStatusType.EXECUTION_ERROR, GLib.Error(error))
         return procedure.new_return_values(Gimp.PDBStatusType.SUCCESS, GLib.Error())

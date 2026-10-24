@@ -62,6 +62,10 @@ sys.stdout = sys.stderr
 with open(__file__, "rb") as _f:
     VERSION = hashlib.sha1(_f.read()).hexdigest()[:12]  # lets the plugin spot an outdated server
 IMAGE_CACHE_SIZE = 4  # images whose SAM2 analysis is kept (about 16 MB of GPU memory each)
+# Full-size results of objects no longer in the selection (undone or replaced clicks) are
+# kept up to this many bytes, oldest dropped first: each is 4 bytes per pixel (192 MB on an
+# 8000x6000 photo), and keeping every click of a session reached 10 GB in a test.
+SPARE_CACHE_BYTES = 1 << 30
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -88,7 +92,10 @@ class Server:
         self.predictor = None
         self.vitmatte = None
         self.image = None
-        self.cache = {}  # (granularity, points) -> (full-res logits, low-res logits)
+        # (granularity, points) or ("box", ...) -> (full-res logits, low-res logits), oldest
+        # first; see prune_cache
+        self.cache = collections.OrderedDict()
+        self.cache_used = set()  # keys used by the current render
         # SAM2's analysis of recent images, so reopening the window on the same image is
         # instant: image hash -> (image, predictor state)
         self.analysed = collections.OrderedDict()
@@ -101,7 +108,13 @@ class Server:
         self.sharp_jobs = []  # [(key, generation, obj, coarse logits, image)], oldest first
         self.sharp_busy = None  # (key, generation) being worked out
         self.sharp_done = {}  # key -> (x1, y1, x2, y2, crop logits), or None: keep the normal one
+        self.sharp_merged = {}  # key -> (cut, full-size logits, state) for the latest Threshold
+        self.sharp_thread = None
         self.generation = 0
+        # One image analysis at a time: two at once (a load while a sharper outline is
+        # worked out) left a 4 GB GPU with 0 MB free and took 35-42 s instead of ~15 s.
+        # Clicks and hover don't need it.
+        self.encoder_lock = threading.Lock()
 
     # --- models --------------------------------------------------------------------
 
@@ -113,7 +126,6 @@ class Server:
                            device=self.device)
         self.predictor = SAM2ImagePredictor(model)
         self.crop_predictor = SAM2ImagePredictor(model)
-        threading.Thread(target=self.sharp_worker, daemon=True).start()
 
     def load_vitmatte(self):
         from detectron2.checkpoint import DetectionCheckpointer
@@ -158,6 +170,7 @@ class Server:
             self.generation += 1
             self.sharp_jobs.clear()
             self.sharp_done.clear()
+            self.sharp_merged.clear()
         key = hashlib.sha1(self.image.tobytes()).hexdigest() + str(self.image.shape)
         cached = key in self.analysed
         if cached:
@@ -166,10 +179,12 @@ class Server:
             pred._features, pred._orig_hw, pred._is_batch = self.analysed[key]
             pred._is_image_set = True
         else:
-            with torch.no_grad():
+            with torch.no_grad(), self.encoder_lock:
                 self.predictor.set_image(self.image)
-            if self.device == "cuda":
-                torch.cuda.synchronize()  # the GPU works asynchronously: "ready" must mean ready
+                if self.device == "cuda":
+                    # The GPU works asynchronously: "ready" must mean ready (and the lock held
+                    # until it is). Only this stream: other work needn't finish.
+                    torch.cuda.current_stream().synchronize()
             pred = self.predictor
             self.analysed[key] = (pred._features, pred._orig_hw, pred._is_batch)
             while len(self.analysed) > IMAGE_CACHE_SIZE:
@@ -186,7 +201,9 @@ class Server:
         SAM2's three candidates (detail / part / whole); later clicks refine it, feeding
         the previous low-res logits back in as SAM2's own interactive demo does."""
         key = (granularity, tuple(map(tuple, points)))
+        self.cache_used.add(key)
         if key in self.cache:
+            self.cache.move_to_end(key)
             return self.cache[key][0]
         coords = np.array([p[:2] for p in points], dtype=np.float32)
         labels = np.array([p[2] for p in points], dtype=np.int32)
@@ -220,7 +237,8 @@ class Server:
             by_size = sorted(containing, key=lambda i: int((masks[i] > 0).sum()))
             pick = {"detail": by_size[0], "part": by_size[len(by_size) // 2],
                     "whole": by_size[-1]}[granularity]
-        return masks[pick], low[pick]
+        # Copies: a view would keep all three full-size candidates alive in the cache
+        return masks[pick].copy(), low[pick].copy()
 
     def cmd_hover(self, req):
         """The outline a click at req["point"] would select, as polygons in image pixels.
@@ -238,7 +256,10 @@ class Server:
         with a click [x, y] inside it. SAM2 recommends a single output for box prompts: the
         box already says how big the object is, so Granularity doesn't apply."""
         key = ("box", tuple(box), tuple(point) if point else None)
-        if key not in self.cache:
+        self.cache_used.add(key)
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        else:
             kwargs = {}
             if point:
                 kwargs = {"point_coords": np.array([point], dtype=np.float32),
@@ -252,9 +273,11 @@ class Server:
 
     @staticmethod
     def sharp_key(obj, granularity):
-        return ("sharp", granularity, json.dumps(obj.get("box")), json.dumps(obj.get("points")))
+        # Granularity doesn't apply to boxes (see box_logits)
+        return ("sharp", None if obj.get("box") else granularity, json.dumps(obj.get("box")),
+                json.dumps(obj.get("points")))
 
-    def sharp_logits(self, obj, granularity, coarse, wait):
+    def sharp_logits(self, obj, granularity, coarse, cut, wait):
         """Sharper outline for one object: SAM2 again, on a crop around the object, at its
         own 1024 px. SAM2's masks come out at a quarter of its 1024 px input, so on a
         4000 px photo each mask cell covers about 16x16 pixels. On 4000x2600 test images
@@ -274,37 +297,74 @@ class Server:
                     and all(j[:2] != job for j in self.sharp_jobs)):
                 self.sharp_jobs.append((key, self.generation, obj, coarse, self.image))
                 self.sharp_lock.notify_all()
+            self.ensure_sharp_worker()
             while wait and key not in self.sharp_done:
-                self.sharp_lock.wait()
+                self.sharp_lock.wait(timeout=1)
+                self.ensure_sharp_worker()  # never wait on a worker that has stopped
             if key not in self.sharp_done:
                 return coarse, "pending"
             refined = self.sharp_done[key]
+            merged = self.sharp_merged.get(key)
         if refined is None:
             return coarse, "skipped"
-        x1, y1, x2, y2, crop_logits = refined
+        if merged is None or merged[0] != cut:
+            merged = (cut, *self.merge_sharp(coarse, refined, cut, obj))
+            with self.sharp_lock:
+                self.sharp_merged[key] = merged
+        return merged[1], merged[2]
+
+    @staticmethod
+    def merge_sharp(coarse, refined, cut, obj):
+        """The sharper crop logits pasted into the normal ones, but only near the outline
+        at this Threshold: it may move by at most one cell of SAM2's own mask grid (where
+        the normal result is coarse), so the object stays the one the user picked."""
+        h, w = coarse.shape
+        x1, y1, x2, y2, crop = refined
+        normal = coarse[y1:y2, x1:x2]
+        edge = cv2.morphologyEx((normal > cut).astype(np.uint8), cv2.MORPH_GRADIENT,
+                                np.ones((3, 3), np.uint8))
+        near = cv2.distanceTransform(1 - edge, cv2.DIST_L2, 5) <= max(h, w) / 256
+        part = np.where(near, crop, normal)
+        point = obj["points"][0][:2] if obj.get("points") else None
+        if point and coarse[point[1], point[0]] > cut and part[point[1] - y1, point[0] - x1] <= cut:
+            return coarse, "skipped"  # never lose the clicked spot
         out = coarse.copy()
-        out[y1:y2, x1:x2] = crop_logits
+        out[y1:y2, x1:x2] = part
         return out, "done"
 
+    def ensure_sharp_worker(self):
+        """Start the background worker if it isn't running (call with sharp_lock held)."""
+        if self.sharp_thread is None or not self.sharp_thread.is_alive():
+            self.sharp_thread = threading.Thread(target=self.sharp_worker, daemon=True)
+            self.sharp_thread.start()
+
     def sharp_worker(self):
-        stream = torch.cuda.Stream() if self.device == "cuda" else None
+        try:
+            stream = torch.cuda.Stream() if self.device == "cuda" else None
+        except Exception:
+            traceback.print_exc()
+            stream = None
         while True:
             with self.sharp_lock:
                 while not self.sharp_jobs:
                     self.sharp_lock.wait()
                 key, generation, obj, coarse, image = self.sharp_jobs.pop(0)
                 self.sharp_busy = (key, generation)
+            refined = None  # on any failure: keep the normal outline
             try:
                 with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
                     refined = self.refine_in_crop(obj, coarse, image)
-            except Exception:
+            except BaseException:
                 traceback.print_exc()
-                refined = None  # keep the normal outline
-            with self.sharp_lock:
-                self.sharp_busy = None
-                if generation == self.generation:
-                    self.sharp_done[key] = refined
-                self.sharp_lock.notify_all()
+            finally:
+                if stream is not None:
+                    stream.synchronize()
+                    torch.cuda.empty_cache()  # give this stream's memory pool back
+                with self.sharp_lock:
+                    self.sharp_busy = None
+                    if generation == self.generation:
+                        self.sharp_done[key] = refined
+                    self.sharp_lock.notify_all()
 
     def cmd_sharp_status(self, req):
         with self.sharp_lock:
@@ -326,7 +386,10 @@ class Server:
         pred = self.crop_predictor
         point = obj["points"][0][:2] if obj.get("points") else None
         with torch.no_grad():
-            pred.set_image(np.ascontiguousarray(image[y1:y2, x1:x2]))
+            with self.encoder_lock:
+                pred.set_image(np.ascontiguousarray(image[y1:y2, x1:x2]))
+                if self.device == "cuda":
+                    torch.cuda.current_stream().synchronize()  # done before letting go
             # The object's extent as a box, the click, and the normal mask itself as SAM2's
             # mask prompt keep it on the same object: seen this much larger, SAM2 otherwise
             # often picked another one (on real photos 41 of 207 refinements overlapped the
@@ -338,15 +401,7 @@ class Server:
                 kwargs["point_coords"] = np.array([[point[0] - x1, point[1] - y1]], dtype=np.float32)
                 kwargs["point_labels"] = np.array([1])
             masks, _, _ = pred.predict(multimask_output=False, return_logits=True, **kwargs)
-        # Only the outline may move, by at most one cell of SAM2's own mask grid (where the
-        # normal result is coarse); the object itself stays the one the user picked.
-        edge = cv2.morphologyEx(mask[y1:y2, x1:x2].astype(np.uint8), cv2.MORPH_GRADIENT,
-                                np.ones((3, 3), np.uint8))
-        near = cv2.distanceTransform(1 - edge, cv2.DIST_L2, 5) <= max(h, w) / 256
-        refined = np.where(near, masks[0], coarse[y1:y2, x1:x2])
-        if point and coarse[point[1], point[0]] > 0 and refined[point[1] - y1, point[0] - x1] <= 0:
-            return None  # never lose the clicked spot
-        return x1, y1, x2, y2, refined
+        return x1, y1, x2, y2, masks[0]  # merged with the normal logits in merge_sharp
 
     def outline(self, mask):
         """A mask's outline as polygons in image pixels, traced at preview resolution."""
@@ -404,6 +459,9 @@ class Server:
         wanted = {self.sharp_key(o, granularity) for o in req["objects"]} if sharp else set()
         with self.sharp_lock:  # forget queued work for objects that are gone (undo, new click)
             self.sharp_jobs = [j for j in self.sharp_jobs if j[0] in wanted]
+            for key in [k for k in self.sharp_merged if k not in wanted]:
+                del self.sharp_merged[key]  # full-size, like the cache
+        self.cache_used = set()
         self.sharp_pending = self.sharp_refined = 0
         for obj in req["objects"]:
             points = obj.get("points", [])
@@ -416,7 +474,7 @@ class Server:
             else:
                 continue
             if sharp and len(obj.get("points", [])) <= 1:
-                logits, state = self.sharp_logits(obj, granularity, logits, wait=bool(req.get("final")))
+                logits, state = self.sharp_logits(obj, granularity, logits, cut, wait=bool(req.get("final")))
                 self.sharp_pending += state == "pending"
                 self.sharp_refined += state == "done"
             mask = logits > cut
@@ -433,7 +491,18 @@ class Server:
                 add |= mask
             else:
                 sub |= mask
+        self.prune_cache()
         return add & ~sub
+
+    def prune_cache(self):
+        """Drop the oldest results of objects not in the current selection beyond
+        SPARE_CACHE_BYTES; those in it are always kept."""
+        spare = [k for k in self.cache if k not in self.cache_used]
+        size = sum(self.cache[k][0].nbytes for k in spare)
+        for key in spare:  # oldest first
+            if size <= SPARE_CACHE_BYTES:
+                break
+            size -= self.cache.pop(key)[0].nbytes
 
     def soft_edges(self, mask, edge, max_side=None):
         """ViTMatte alpha in a band around the mask's edge (on a crop around the mask).
@@ -552,6 +621,33 @@ def serve(server, lines, out):
     return False
 
 
+def process_start(pid):
+    """When process `pid` started, as a string, or None if unknown. Written to the state
+    file so the installer and uninstaller can tell this server from a later process that
+    happens to get the same pid; they compute it the same way."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if not k.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                    return None
+                return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+            finally:
+                k.CloseHandle(handle)
+        import subprocess
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def listen(server, settings):
     """Stay alive between plugin runs: accept one connection at a time on a local port and
     exit after AISELECT_KEEPALIVE seconds without one. The port and a random token go to
@@ -563,7 +659,8 @@ def listen(server, settings):
     sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     sock.bind(("127.0.0.1", 0))
     sock.listen(1)
-    state = {"port": sock.getsockname()[1], "pid": os.getpid(), "token": token, "version": VERSION,
+    state = {"port": sock.getsockname()[1], "pid": os.getpid(), "started": process_start(os.getpid()),
+             "token": token, "version": VERSION,
              "settings": settings}
     tmp = state_file + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:

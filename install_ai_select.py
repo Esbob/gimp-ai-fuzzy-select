@@ -26,6 +26,7 @@ Only the Python standard library is needed to run this script.
 
 import argparse
 import json
+import locale
 import os
 import platform
 import shutil
@@ -175,17 +176,43 @@ def default_install_dir():
 
 
 def detect_nvidia_gpu():
-    """Return (name, compute_capability) or None."""
+    """Return (name, compute capability or None, driver version) or None. Older drivers'
+    nvidia-smi has no compute_cap field: then the capability is None, not "no GPU"."""
     exe = shutil.which("nvidia-smi")
     if not exe:
         return None
+    for fields in ("driver_version,compute_cap,name", "driver_version,name"):  # name last: may hold commas
+        try:
+            out = subprocess.run([exe, f"--query-gpu={fields}", "--format=csv,noheader"],
+                                 capture_output=True, text=True, timeout=30)
+            if out.returncode:
+                continue
+            line = out.stdout.strip().splitlines()[0]
+            if fields.count(",") == 2:
+                driver, cap, name = line.split(",", 2)
+                return name.strip(), float(cap), driver.strip()
+            driver, name = line.split(",", 1)
+            return name.strip(), None, driver.strip()
+        except Exception:
+            continue
+    return None
+
+
+def driver_major(version):
     try:
-        out = subprocess.run([exe, "--query-gpu=name,compute_cap", "--format=csv,noheader"],
-                             capture_output=True, text=True, timeout=30).stdout.strip()
-        name, _, cap = out.splitlines()[0].rpartition(",")
-        return name.strip(), float(cap)
-    except Exception:
-        return None
+        return int(str(version).split(".")[0])
+    except ValueError:
+        return 0
+
+
+def choose_torch_index(gpu):
+    """PyTorch wheels for this GPU. CUDA 13 builds need compute 7.5+ (they dropped
+    Maxwell/Pascal/Volta) and driver r580+; CUDA 12.6 builds cover compute 5.0+ and need
+    driver r528+ (Windows) / r525+ (Linux)."""
+    name, cap, driver = gpu
+    if cap is not None and cap >= 7.5 and driver_major(driver) >= 580:
+        return "cu130"
+    return "cu126"
 
 
 def find_gimp_plugins_dir():
@@ -236,6 +263,31 @@ SERVER_STATE = Path(tempfile.gettempdir()) / "aiselect_server.json"
 SERVER_LOG = Path(tempfile.gettempdir()) / "aiselect_server.log"
 
 
+def process_start(pid):
+    """When process `pid` started, as a string, or None if unknown (computed the same way
+    as in aiselect_server.py, which writes its own to the state file)."""
+    try:
+        if sys.platform == "win32":
+            import ctypes
+            from ctypes import wintypes
+            k = ctypes.windll.kernel32
+            k.OpenProcess.restype = wintypes.HANDLE
+            handle = k.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+            if not handle:
+                return None
+            try:
+                times = [wintypes.FILETIME() for _ in range(4)]
+                if not k.GetProcessTimes(handle, *[ctypes.byref(t) for t in times]):
+                    return None
+                return str((times[0].dwHighDateTime << 32) | times[0].dwLowDateTime)
+            finally:
+                k.CloseHandle(handle)
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(pid)], capture_output=True, text=True)
+        return out.stdout.strip() or None
+    except Exception:
+        return None
+
+
 def stop_backend():
     """Stop a running AI Fuzzy Select backend (it stays alive between plugin runs and
     holds files in the virtual environment open). Returns True if one was running."""
@@ -254,12 +306,21 @@ def stop_backend():
             stopped = True
     except (OSError, KeyError, ValueError):
         pass
-    if not stopped and state.get("pid"):
-        try:  # not answering: end the process
-            os.kill(state["pid"], signal.SIGTERM)
-            stopped = True
-        except OSError:
-            pass
+    pid = state.get("pid")
+    if not stopped and pid:
+        # Not answering: end it, but only if that pid is still the backend that wrote the
+        # state file (same start time). After a crash or reboot the pid may belong to
+        # another program by now.
+        started = state.get("started")
+        if started and process_start(pid) == started:
+            try:
+                os.kill(pid, signal.SIGTERM)
+                stopped = True
+            except OSError:
+                pass
+        elif process_start(pid) is not None:
+            print(f"    Note: the backend didn't answer and process {pid} can't be confirmed to be it; "
+                  "left running. If it is a stuck AI Fuzzy Select backend, end it in Task Manager.")
     time.sleep(1)  # let it exit and release its files
     try:
         SERVER_STATE.unlink()
@@ -272,6 +333,14 @@ def stop_backend():
 def create_venv(venv_dir):
     py = venv_python(venv_dir)
     if py.exists():
+        out = subprocess.run([str(py), "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+                             capture_output=True, text=True)
+        version = out.stdout.strip()
+        if out.returncode or version not in ("3.10", "3.11", "3.12", "3.13"):
+            sys.exit(f"The existing environment {venv_dir} doesn't work"
+                     f"{f' (it uses Python {version})' if version else ''}: probably the Python it was "
+                     f"made with was removed or upgraded. Delete the folder {venv_dir} and run the "
+                     "installer again (the downloaded checkpoints are kept).")
         ok(f"Reusing existing virtual environment: {venv_dir}")
     else:
         run([sys.executable, "-m", "venv", venv_dir])
@@ -280,7 +349,25 @@ def create_venv(venv_dir):
     return py
 
 
+def installed_torch_build(py):
+    """The build of the venv's torch ("cpu", "cu126", ...), or None if there is none."""
+    out = subprocess.run([str(py), "-c", "import torch; print(torch.version.cuda or 'cpu')"],
+                         capture_output=True, text=True)
+    if out.returncode:
+        return None
+    cuda = out.stdout.strip().splitlines()[-1]
+    return "cpu" if cuda == "cpu" else "cu" + cuda.replace(".", "")
+
+
 def install_sam2(py, index, src):
+    # pip treats any installed torch as good enough: replace one of another build (e.g. a
+    # CPU build after adding a GPU, or after --torch-index)
+    have = installed_torch_build(py)
+    known = index == "cpu" or index.startswith("cu")  # (a custom index can't be compared)
+    again = ["--force-reinstall", "--no-deps"] if known and have and have != index else []
+    if again:
+        info(f"Replacing the installed PyTorch ({have}) with the {index} build")
+        run([py, "-m", "pip", "install", *again, "torch", "torchvision", "--index-url", TORCH_INDEX.format(index)])
     run([py, "-m", "pip", "install", "torch", "torchvision", "--index-url", TORCH_INDEX.format(index)])
     run([py, "-m", "pip", "install", "opencv-python-headless", "numpy"])
     sam2 = fetch_repo(*SAM2, src / "sam2")
@@ -303,7 +390,13 @@ def install_soft_edges(py, src):
         shutil.copytree(d2 / "configs", zoo_configs)
     vitmatte = fetch_repo(*MATTE_ANYTHING, src / "Matte-Anything")
     pth = site_packages(py) / "ai_select_sources.pth"
-    pth.write_text(f"{d2}\n", encoding="utf-8")
+    # Python 3.10-3.12 read .pth files in the locale encoding, 3.13 tries UTF-8 first and
+    # then the locale: the locale encoding works for all, for a path it can represent
+    # (C:\Users\Søren, say).
+    try:
+        pth.write_bytes(f"{d2}\n".encode(locale.getpreferredencoding(False)))
+    except UnicodeEncodeError:
+        pth.write_text(f"{d2}\n", encoding="utf-8")
     ok(f"detectron2 registered in {pth}")
     return vitmatte
 
@@ -415,8 +508,8 @@ def call(**req):
     return reply
 res = {}
 t0 = time.time()
-call(cmd="load", image=os.path.join(work, "input.png"), preview=os.path.join(work, "p.png"),
-     preview_width=400, preview_height=300)
+res["device"] = call(cmd="load", image=os.path.join(work, "input.png"), preview=os.path.join(work, "p.png"),
+                     preview_width=400, preview_height=300)["device"]
 res["load_s"] = round(time.time() - t0, 1)
 out = os.path.join(work, "sel.raw")
 def final(objs, **kw):
@@ -493,20 +586,20 @@ try:
     w, h = img.get_width(), img.get_height()
     proc = Gimp.get_pdb().lookup_procedure("plug-in-ai-select")
     report["registered"] = proc is not None
-    def ai_select(operation, output="selection"):
+    def ai_select(operation, output="selection", drawables=None, image=None):
         cfg = proc.create_config()
         cfg.set_property("run-mode", Gimp.RunMode.NONINTERACTIVE)
-        cfg.set_property("image", img)
-        cfg.set_core_object_array("drawables", img.get_layers())
+        cfg.set_property("image", image or img)
+        cfg.set_core_object_array("drawables", drawables or (image or img).get_layers())
         cfg.set_property("objects", json.dumps([{"sign": 1, "points": [[400, 300, 1]]}]))
         cfg.set_property("operation", operation)
         cfg.set_property("output", output)
-        return str(proc.run(cfg).index(0))
+        return proc.run(cfg).index(0) == Gimp.PDBStatusType.SUCCESS
     def value(drawable, x, y):
         f = "Y' u8" if Babl.get_name(drawable.get_format()).startswith("Y'") else "Y u8"
         return bytes(drawable.get_buffer().get(Gegl.Rectangle.new(x, y, 1, 1), 1.0, f,
                                                Gegl.AbyssPolicy.NONE))[0]
-    report["status"] = ai_select("replace")
+    report["status"] = str(ai_select("replace"))
     # Before Selection.save, which selects the channel it creates.
     report["layer_still_selected"] = [l.get_name() for l in img.get_selected_layers()]
     chan = Gimp.Selection.save(img)
@@ -514,7 +607,7 @@ try:
     open(args["mask_out"], "wb").write(bytes(chan.get_buffer().get(
         Gegl.Rectangle.new(0, 0, w, h), 1.0, fmt, Gegl.AbyssPolicy.NONE)))
     img.select_rectangle(Gimp.ChannelOps.REPLACE, 5, 5, 40, 40)
-    report["status_add"] = ai_select("add")
+    report["status_add"] = str(ai_select("add"))
     report["add_keeps_old"] = Gimp.Selection.value(img, 20, 20) == 255
     report["add_has_disc"] = Gimp.Selection.value(img, 400, 300) == 255
     # Other results: a new layer with the result as its mask, and a channel.
@@ -532,6 +625,46 @@ try:
     ours = [c for c in img.get_channels() if c.get_name().startswith("AI Fuzzy Select")]
     report["channel_result"] = (len(ours) == 1 and value(ours[0], 400, 300) == 255
                                 and bool(img.get_selected_layers()))
+    # Unusual cases. GIMP ends a plug-in that writes to a pixel-locked layer or its mask:
+    # "mask" on one is refused, a cut-out of one works (and stays locked).
+    base = img.get_layers()[-1]
+    base.set_lock_content(True)
+    alpha_at = lambda layer, x, y: bytes(layer.get_buffer().get(Gegl.Rectangle.new(x, y, 1, 1), 1.0,
+                                                                "R'G'B'A u8", Gegl.AbyssPolicy.NONE))[3]
+    refused = not ai_select("replace", "mask", [base])
+    cut_ok = ai_select("replace", "cutout", [base])
+    above = img.get_layers()[-2]  # the cut-out goes right above its layer
+    locked = {"mask refused": refused, "no mask added": base.get_mask() is None, "cut-out made": cut_ok,
+              "cut-out locked": above.get_lock_content(), "cut out": alpha_at(above, 5, 5) == 0}
+    report["locked_layer"] = all(locked.values()) or locked
+    base.set_lock_content(False)
+    # The drawable a script names gets the mask (not the selected layer), and a second run
+    # replaces that mask
+    img.set_selected_layers([img.get_layers()[0]])
+    first = ai_select("replace", "mask", [base])
+    mask1 = base.get_mask() is not None and (value(base.get_mask(), 400, 300), value(base.get_mask(), 5, 5))
+    second = ai_select("replace", "mask", [base])
+    mask2 = base.get_mask() is not None and (value(base.get_mask(), 400, 300), value(base.get_mask(), 5, 5))
+    used = {"first run": first, "mask values": mask1, "second run": second, "mask values after": mask2}
+    report["drawable_used"] = (first and second and mask1 == (255, 0) and mask2 == (255, 0)) or str(used)
+    # A cut-out of a layer group is a normal layer with the outside deleted
+    group = Gimp.GroupLayer.new(img, "group")
+    img.insert_layer(group, None, 0)
+    img.insert_layer(base.copy(), group, 0)
+    ai_select("replace", "cutout", [group])
+    gcut = img.get_layers()[0]
+    report["group_cutout"] = (not gcut.is_group() and gcut.get_mask() is None
+                              and bytes(gcut.get_buffer().get(Gegl.Rectangle.new(5, 5, 1, 1), 1.0, "R'G'B'A u8",
+                                                              Gegl.AbyssPolicy.NONE))[3] == 0)
+    # A wrong option is refused before anything changes (no stray channel)
+    channels = len(img.get_channels())
+    report["bad_option"] = not ai_select("Add") and len(img.get_channels()) == channels
+    # Nothing visible: a message, not a crash
+    hidden = img.duplicate()
+    for layer in hidden.get_layers():
+        layer.set_visible(False)
+    report["all_hidden"] = not ai_select("replace", image=hidden)
+    hidden.delete()
     img.delete()
 except Exception:
     import traceback
@@ -637,7 +770,9 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (r["grow_bigger"], "grow enlarges the selection"),
         (r["mae_sharp"] <= r["mae_click"] + 0.002,
          f"sharper outlines work (error vs true alpha {r['mae_sharp']:.4f} vs {r['mae_click']:.4f}, {r['sharp_s']} s)"),
-        (r["sharp_pending_first"] == 1 and r["sharp_refined_after"] == 1 and r["sharp_hover_ms"] < 1500,
+        # (a hover takes longer on a CPU-only install, where the refinement uses every core)
+        (r["sharp_pending_first"] == 1 and r["sharp_refined_after"] == 1
+         and (r["sharp_hover_ms"] < 1500 or r["device"] == "cpu"),
          f"sharper outlines are worked out in the background (preview {r['sharp_preview_ms']} ms, "
          f"hover meanwhile {r['sharp_hover_ms']} ms, then shown: {r['sharp_refined_after'] == 1})"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
@@ -661,7 +796,7 @@ def run_gimp_test(py, gimp_console, work):
     t0 = time.time()
     try:
         subprocess.run([str(gimp_console), "-i", "--batch-interpreter=python-fu-eval",
-                        "-b", f"exec(open(r'{script}').read())", "--quit"],
+                        "-b", f"exec(open({str(script)!r}, encoding='utf-8').read())", "--quit"],
                        capture_output=True, timeout=900)
     except subprocess.TimeoutExpired:
         fail("Headless GIMP did not finish within 15 minutes")
@@ -685,7 +820,13 @@ def run_gimp_test(py, gimp_console, work):
         f"new layer with mask: {report.get('layer_result')}; cut-out: {report.get('cutout_result')}; "
         f"channel: {report.get('channel_result')} "
         f"({time.time() - t0:.0f} s incl. GIMP start)")
-    return bool(passed)
+    unusual = {"locked layer": "locked_layer", "the script's drawable": "drawable_used",
+               "group cut-out": "group_cutout", "a wrong option refused": "bad_option",
+               "nothing visible": "all_hidden"}
+    unusual_ok = all(report.get(k) is True for k in unusual.values())  # else: the details
+    (ok if unusual_ok else fail)("in GIMP, unusual cases: " + "; ".join(
+        f"{label}: {report.get(k)}" for label, k in unusual.items()))
+    return bool(passed and unusual_ok)
 
 
 def run_window_test(gimp_console, plugin_dir, settings, work):
@@ -774,8 +915,7 @@ def main():
     elif gpu is None or sys.platform == "darwin":
         index = "cpu"
     else:
-        # CUDA 13 builds dropped Maxwell/Pascal/Volta; CUDA 12.6 builds still cover sm_50+.
-        index = "cu126" if gpu[1] < 7.5 else "cu130"
+        index = choose_torch_index(gpu)
     plugins_dir = args.gimp_plugins_dir or find_gimp_plugins_dir()
     if plugins_dir is None:
         sys.exit("No GIMP 3 user profile found. Start GIMP 3 once, or pass --gimp-plugins-dir.")
@@ -783,11 +923,14 @@ def main():
 
     print("AI Fuzzy Select installer")
     info(f"Install dir : {install_dir}")
-    info(f"GPU         : {f'{gpu[0]} (compute {gpu[1]})' if gpu else 'none detected'}")
+    info(f"GPU         : {f'{gpu[0]} (compute {gpu[1] or "unknown"}, driver {gpu[2]})' if gpu else 'none detected'}")
     info(f"PyTorch     : {index} wheels")
     info(f"Soft edges  : {'yes (ViTMatte)' if soft else 'no'}")
     info(f"GIMP plugin : {plugins_dir / 'aiselect'}")
     info(f"GIMP tests  : {gimp_console or 'skipped (gimp-console not found)'}")
+    if gpu and index.startswith("cu") and driver_major(gpu[2]) < 528:
+        print(f"\nWARNING: NVIDIA driver {gpu[2]} is older than PyTorch's GPU builds need (528 or "
+              "newer). Update the driver from nvidia.com, or the GPU can't be used.")
     if index == "cpu":
         print("\nNote: without an NVIDIA GPU everything runs on the CPU: analysing an image takes "
               "much longer, clicks stay reasonably quick.")
