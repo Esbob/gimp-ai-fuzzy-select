@@ -130,6 +130,8 @@ Close GIMP first.
 
 ## Credits and licences
 
+Co-authored with [Claude Code](https://claude.com/claude-code) (Claude Opus 5.5, by Anthropic).
+
 This plug-in is MIT-licensed (see [LICENSE](LICENSE)). The installer downloads, at pinned
 versions:
 
