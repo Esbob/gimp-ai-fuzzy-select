@@ -53,7 +53,7 @@ SERVER = os.path.join(PLUGIN_DIR, "aiselect_server.py")
 PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 
 DEFAULT_OPTIONS = {
-    "granularity": "auto", "threshold": 50, "fill_holes": 12, "grow": 0, "feather": 0,
+    "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
     "soft": False, "edge": 4, "operation": "replace",
 }
 RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "soft", "edge")
@@ -370,7 +370,11 @@ class AISelectDialog(Gtk.Dialog):
 
         self.fill_holes = spin(0, 500, "fill_holes")
         add_row("Fill holes (px)", self.fill_holes,
-                "Fill enclosed holes up to this size; 0 keeps every hole (e.g. sky between branches)")
+                "Fills holes in the selection up to this diameter in pixels, e.g. a window in "
+                "a wall you want selected as solid. Only holes completely surrounded by the "
+                "selection are filled; gaps open to the outside are not holes. SAM2 already "
+                "includes holes smaller than about 10 px by itself. 0 = off, keeps every hole "
+                "(e.g. sky between branches).")
         self.grow = spin(-100, 100, "grow")
         add_row("Grow/shrink (px)", self.grow, "Grow (positive) or shrink (negative) the selection")
         self.feather = spin(0, 200, "feather")
@@ -1056,7 +1060,7 @@ class AISelect(Gimp.PlugIn):
                                       'Clicks: [{"sign": 1, "points": [[x, y, 1]]}]', "[]", rw)
         procedure.add_int_argument("threshold", "Threshold", "0-100, 50 = SAM2 default", 0, 100, 50, rw)
         procedure.add_string_argument("granularity", "Granularity", "auto, whole, part or detail", "auto", rw)
-        procedure.add_int_argument("fill-holes", "Fill holes", "Max hole size (px)", 0, 500, 12, rw)
+        procedure.add_int_argument("fill-holes", "Fill holes", "Fill enclosed holes up to this diameter (px); 0 = off", 0, 500, 0, rw)
         procedure.add_int_argument("grow", "Grow/shrink", "Pixels", -100, 100, 0, rw)
         procedure.add_int_argument("feather", "Feather", "Pixels", 0, 200, 0, rw)
         procedure.add_boolean_argument("soft", "Soft edges", "ViTMatte soft edges", False, rw)

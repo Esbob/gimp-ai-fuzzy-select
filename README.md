@@ -36,7 +36,7 @@ is held.
 |---|---|
 | Granularity | Auto, Whole object, Part or Detail: whether each click selects, adds or subtracts a whole object or a part of it (e.g. tree → crown → branch) |
 | Threshold | Like Fuzzy Select's threshold: higher selects more, lower selects less (50 = SAM 2's own cut-off) |
-| Fill holes | Fill enclosed holes up to this size in pixels; 0 keeps every hole (e.g. sky between branches) |
+| Fill holes | Fill holes in the selection up to this diameter in pixels, e.g. a window in a wall you want selected as solid. Only holes completely surrounded by the selection are filled, and SAM 2 already includes holes smaller than about 10 px. 0 (default) = off, keeps every hole (e.g. sky between branches) |
 | Grow/shrink | Grow or shrink the selection, in pixels |
 | Feather | Soften the selection edge, in pixels |
 | Soft edges (ViTMatte) | Refine fuzzy edges such as hair and foliage into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte); applied when you press Select |
