@@ -39,7 +39,7 @@ is held.
 | Fill holes | Fill holes in the selection up to this diameter in pixels, e.g. a window in a wall you want selected as solid. Only holes completely surrounded by the selection are filled, and SAM 2 already includes holes smaller than about 10 px. 0 (default) = off, keeps every hole (e.g. sky between branches) |
 | Grow/shrink | Grow or shrink the selection, in pixels |
 | Feather | Soften the selection edge, in pixels |
-| Soft edges (ViTMatte) | Refine fuzzy edges such as hair and foliage into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte); applied when you press Select |
+| Soft edges (ViTMatte) | Turn fuzzy edges such as fur and hair into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte), picking out individual hairs near the object's outline. On hard edges it mostly makes the outline smoother and more accurate. The effect is best seen in the **Mask** view. The preview shows soft edges a moment after each change; pressing **Select** computes them at full resolution |
 | Existing selection in GIMP | Only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
 Your options are remembered between runs.
@@ -50,6 +50,11 @@ The window opens maximized with the image fitted to it. Zoom with the toolbar bu
 (−, +, Fit, 100%, 200%), GIMP's keys (**+**, **−**, **1**, **2**, **Shift+Ctrl+J**) or
 Ctrl+scroll around the pointer. Pan by scrolling or by dragging with the middle mouse
 button.
+
+The **View** buttons switch between **Overlay** (the selection as a tinted overlay on the
+image) and **Mask** (the selection itself, white on black, like a GIMP channel), also with
+the **M** key. Mask view is the way to see soft edges and feathering: partially selected
+pixels show as grey.
 
 ### How it works
 

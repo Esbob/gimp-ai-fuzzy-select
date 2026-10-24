@@ -76,8 +76,9 @@ def load_json(path, default):
 
 class Backend:
     """Runs aiselect_server.py and talks to it one request at a time on a worker thread.
-    Interactive requests can be 'coalesced': a newer one replaces a queued, unsent one,
-    so dragging a slider doesn't build up a backlog."""
+    Interactive requests can be 'coalesced' by group: a newer request replaces a queued,
+    unsent one of the same group (e.g. "preview"), so dragging a slider doesn't build up a
+    backlog, while fast previews and slower soft-edge previews don't cancel each other."""
 
     def __init__(self, settings):
         self.proc = subprocess.Popen(
@@ -100,7 +101,7 @@ class Backend:
     def request(self, req, callback, coalesce=False, main_loop=True):
         with self.cond:
             if coalesce:
-                self.queue = [q for q in self.queue if not q[2]]
+                self.queue = [q for q in self.queue if q[2] != coalesce]
             self.next_id += 1
             req["id"] = self.next_id
             self.queue.append((req, callback, coalesce, main_loop))
@@ -207,6 +208,8 @@ class AISelectDialog(Gtk.Dialog):
         self.base_scaled = None  # base pre-scaled for the current zoom, when zoomed out
         self.overlay = None
         self.preview_count = 0
+        self.version = 0  # bumped on every change; older preview results are discarded
+        self.soft_timer = None
         self.pan_start = None
         self.cursors = {}
         self.modifiers = 0  # Shift/Ctrl currently held, for the cursor's +/- sign
@@ -383,9 +386,14 @@ class AISelectDialog(Gtk.Dialog):
 
         self.soft = Gtk.CheckButton(label="Soft edges (ViTMatte)")
         self.soft.set_active(self.options["soft"])
-        self.soft.set_tooltip_text("Refines hair, foliage and other fuzzy edges into a partial "
-                                   "selection. Applied when you press Select (a few seconds).")
-        self.soft.connect("toggled", lambda w: self.options.update(soft=w.get_active()))
+        self.soft.set_tooltip_text(
+            "Turns fuzzy edges such as fur and hair into a partial selection, picking out "
+            "individual hairs near the object's outline. On hard edges it mostly makes the "
+            "outline smoother and more accurate.\n\n"
+            "The effect is best seen in the Mask view (View: Mask above the image, or the M "
+            "key), where partially selected pixels show as grey. The preview shows soft edges "
+            "a moment after each change; pressing Select computes them at full resolution.")
+        self.soft.connect("toggled", lambda w: self.option_changed("soft", w.get_active()))
         if not self.soft_available:
             self.soft.set_sensitive(False)
             self.soft.set_tooltip_text("Not installed (install_ai_select.py --no-soft-edges)")
@@ -431,6 +439,21 @@ class AISelectDialog(Gtk.Dialog):
         self.zoom_label = Gtk.Label(label="")
         self.zoom_label.set_width_chars(7)
         bar.pack_start(self.zoom_label, False, False, 6)
+
+        # Overlay: tinted selection over the image. Mask: the selection itself, white on
+        # black, where soft edges and feathering show as grey.
+        bar.pack_start(Gtk.Separator(orientation=Gtk.Orientation.VERTICAL), False, False, 4)
+        bar.pack_start(Gtk.Label(label="View:"), False, False, 2)
+        self.overlay_button = Gtk.RadioButton.new_with_label_from_widget(None, "Overlay")
+        self.overlay_button.set_tooltip_text("The selection as a tinted overlay on the image (M toggles)")
+        self.mask_button = Gtk.RadioButton.new_with_label_from_widget(self.overlay_button, "Mask")
+        self.mask_button.set_tooltip_text("The selection itself, white on black: soft edges and "
+                                          "feathering show as grey (M toggles)")
+        for button in (self.overlay_button, self.mask_button):
+            button.set_mode(False)  # look like toggle buttons, not radio dots
+            button.set_focus_on_click(False)
+            bar.pack_start(button, False, False, 0)
+        self.mask_button.connect("toggled", lambda b: self.render())
         size = Gtk.Label(label=f"{self.image_size[0]} × {self.image_size[1]} px")
         size.set_opacity(0.7)
         bar.pack_end(size, False, False, 6)
@@ -727,6 +750,10 @@ class AISelectDialog(Gtk.Dialog):
             self.set_zoom(1.0)
         elif key in (Gdk.KEY_2, Gdk.KEY_KP_2):
             self.set_zoom(2.0)
+        elif key in (Gdk.KEY_m, Gdk.KEY_M):
+            # A radio button can't be switched off directly: switch the other one on.
+            other = self.overlay_button if self.mask_button.get_active() else self.mask_button
+            other.set_active(True)
         else:
             return False
         return True
@@ -747,17 +774,40 @@ class AISelectDialog(Gtk.Dialog):
             req["out"] = out
         return req
 
+    def preview_request(self, soft):
+        self.preview_count += 1
+        req = self.render_request()
+        req["preview_out"] = f"{os.path.splitext(self.preview_png)[0]}_{self.preview_count}.png"
+        req["soft_preview"] = soft
+        req["view"] = "mask" if self.mask_button.get_active() else "overlay"
+        return req
+
     def render(self):
+        """Fast preview right away; with Soft edges on, a soft-edge preview follows once
+        the clicks and options have been still for a moment."""
         self.area.queue_draw()  # show the new click marker right away
         self.select_button.set_sensitive(bool(self.objects))
+        self.version += 1
+        if self.soft_timer:
+            GLib.source_remove(self.soft_timer)
+            self.soft_timer = None
         if not self.objects:
             self.overlay = None
             self.set_status("Click an object to select it.")
             return
-        self.preview_count += 1
-        req = self.render_request()
-        req["preview_out"] = f"{os.path.splitext(self.preview_png)[0]}_{self.preview_count}.png"
-        self.backend.request(req, self.on_rendered, coalesce=True)
+        version = self.version
+        self.backend.request(self.preview_request(soft=False),
+                             lambda reply: self.on_rendered(reply, version), coalesce="preview")
+        if self.options["soft"] and self.soft_available:
+            self.soft_timer = GLib.timeout_add(500, self.request_soft_preview, version)
+
+    def request_soft_preview(self, version):
+        self.soft_timer = None
+        if version == self.version:
+            self.backend.request(self.preview_request(soft=True),
+                                 lambda reply: self.on_rendered(reply, version, soft=True),
+                                 coalesce="soft")
+        return False
 
     def on_loaded(self, reply):
         if not reply["ok"]:
@@ -770,21 +820,31 @@ class AISelectDialog(Gtk.Dialog):
                         "Click an object to select it.")
         return False
 
-    def on_rendered(self, reply):
+    def on_rendered(self, reply, version, soft=False):
         if not reply["ok"]:
             self.set_status("Error: " + reply["error"])
             return False
-        if not self.objects:  # cleared while the request was in flight
-            return False
-        self.overlay = surface_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file(reply["preview"]))
+        stale = version != self.version or not self.objects  # changed while in flight
+        if not stale:
+            self.overlay = surface_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file(reply["preview"]))
         try:
             os.remove(reply["preview"])
         except OSError:
             pass
+        if stale:
+            return False
         pct = 100 * reply["area"] / (self.image_size[0] * self.image_size[1])
         clicks = sum(len(o["points"]) for o in self.objects)
-        self.set_status(f"{pct:.1f}% of the image selected ({clicks} click{'s' * (clicks != 1)}, "
-                        f"{reply['seconds'] * 1000:.0f} ms)")
+        status = f"{pct:.1f}% of the image selected ({clicks} click{'s' * (clicks != 1)}"
+        if soft:
+            status += f", soft edges shown, {reply['seconds']:.1f} s)"
+            if not self.mask_button.get_active():
+                status += " - switch the view to Mask to see them"
+        elif self.options["soft"] and self.soft_available:
+            status += ") - refining soft edges..."
+        else:
+            status += f", {reply['seconds'] * 1000:.0f} ms)"
+        self.set_status(status)
         self.area.queue_draw()
         return False
 

@@ -8,10 +8,13 @@ Protocol: one JSON object per line on stdin, one JSON reply per line on stdout.
   {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h}
       encode the image; "preview" is where render writes its overlay
   {"cmd": "render", "objects": [...], "threshold": 0-100, "granularity": "auto"|"detail"|
-   "part"|"whole", "grow": px, "feather": px, "final": false, "soft": false, "out": raw}
+   "part"|"whole", "fill_holes": px, "grow": px, "feather": px, "soft": false,
+   "final": false, "soft_preview": false, "out": raw, "preview_out": png}
       objects: [{"sign": 1 or -1, "points": [[x, y, label], ...]}, ...] in image pixels;
       the selection is (union of sign 1 objects) minus (union of sign -1 objects).
-      Not final: write a tinted preview overlay PNG with an outline.
+      Not final: write a tinted preview overlay PNG with an outline to "preview_out"
+      (with "soft" and "soft_preview": ViTMatte edges computed at reduced size;
+      "view": "mask" writes the selection as a white-on-black image instead).
       Final: write the full-size 8-bit selection to "out" (optionally with ViTMatte edges).
   {"cmd": "quit"}
 Every reply has "id" (echoed from the request) and "ok", plus "error" on failure.
@@ -168,8 +171,10 @@ class Server:
                 sub |= mask
         return add & ~sub
 
-    def soft_edges(self, mask, edge):
-        """ViTMatte alpha in a band around the mask's edge (on a crop around the mask)."""
+    def soft_edges(self, mask, edge, max_side=None):
+        """ViTMatte alpha in a band around the mask's edge (on a crop around the mask).
+        max_side: for previews, run ViTMatte on the crop scaled down to at most this many
+        pixels on its long side (much faster) and scale the alpha back up."""
         if self.vitmatte is None:
             self.load_vitmatte()
         h, w = mask.shape
@@ -178,16 +183,26 @@ class Server:
         y1, y2 = max(ys.min() - margin, 0), min(ys.max() + margin + 1, h)
         x1, x2 = max(xs.min() - margin, 0), min(xs.max() + margin + 1, w)
         crop = (mask[y1:y2, x1:x2] * 255).astype(np.uint8)
-        kernel = np.ones((edge, edge), np.uint8)
+        image = np.ascontiguousarray(self.image[y1:y2, x1:x2])
+        ch, cw = crop.shape
+        scale = min(1.0, max_side / max(ch, cw)) if max_side else 1.0
+        if scale < 1:
+            size = (max(1, round(cw * scale)), max(1, round(ch * scale)))
+            image = cv2.resize(image, size, interpolation=cv2.INTER_AREA)
+            crop = ((cv2.resize(crop, size, interpolation=cv2.INTER_AREA) > 127) * 255).astype(np.uint8)
+        # Keep the soft band the same width in image pixels at any scale.
+        k = max(1, round(edge * scale))
+        kernel = np.ones((k, k), np.uint8)
         trimap = np.zeros(crop.shape, np.float32)
         trimap[cv2.dilate(crop, kernel, iterations=5) == 255] = 0.5
         trimap[cv2.erode(crop, kernel, iterations=5) == 255] = 1
         with torch.no_grad():
             alpha = self.vitmatte({
-                "image": torch.from_numpy(np.ascontiguousarray(self.image[y1:y2, x1:x2]))
-                .permute(2, 0, 1).unsqueeze(0) / 255,
+                "image": torch.from_numpy(image).permute(2, 0, 1).unsqueeze(0) / 255,
                 "trimap": torch.from_numpy(trimap).unsqueeze(0).unsqueeze(0),
             })["phas"].flatten(0, 2).cpu().numpy()
+        if scale < 1:
+            alpha = cv2.resize(alpha, (cw, ch), interpolation=cv2.INTER_LINEAR)
         out = np.zeros((h, w), np.float32)
         out[y1:y2, x1:x2] = alpha
         return out
@@ -204,8 +219,10 @@ class Server:
             k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * abs(grow) + 1,) * 2)
             m8 = mask.astype(np.uint8)
             mask = (cv2.dilate(m8, k) if grow > 0 else cv2.erode(m8, k)).astype(bool)
-        if req.get("final") and req.get("soft") and mask.any():
-            alpha = self.soft_edges(mask, int(req.get("edge", 4)))
+        if req.get("soft") and mask.any() and (req.get("final") or req.get("soft_preview")):
+            # Previews use a reduced-size crop: seconds become a fraction of a second.
+            max_side = None if req.get("final") else int(req.get("soft_preview_size", 1024))
+            alpha = self.soft_edges(mask, int(req.get("edge", 4)), max_side)
         else:
             alpha = mask.astype(np.float32)
         feather = float(req.get("feather", 0))
@@ -220,13 +237,18 @@ class Server:
         else:
             # A fresh file per preview, so the window can read one while the next is written.
             path = req.get("preview_out") or self.preview_path
-            self.write_preview(alpha, path)
+            self.write_preview(alpha, path, req.get("view", "overlay"))
             return {"area": area, "seconds": round(time.time() - t0, 3), "preview": path}
         return {"area": area, "seconds": round(time.time() - t0, 3)}
 
-    def write_preview(self, alpha, path):
+    def write_preview(self, alpha, path, view="overlay"):
         pw, ph = self.preview_size
         small = cv2.resize(alpha, (pw, ph), interpolation=cv2.INTER_AREA)
+        if view == "mask":
+            # The selection itself, white on black: partial selection (soft edges,
+            # feathering) shows as grey, which the tinted overlay can't make visible.
+            cv2.imwrite(path, np.round(np.clip(small, 0, 1) * 255).astype(np.uint8))
+            return
         overlay = np.zeros((ph, pw, 4), np.uint8)
         overlay[..., :3] = TINT
         overlay[..., 3] = np.round(np.clip(small, 0, 1) * 110).astype(np.uint8)
