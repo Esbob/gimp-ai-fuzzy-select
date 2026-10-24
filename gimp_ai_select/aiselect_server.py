@@ -1,10 +1,17 @@
 """
 Backend for the GIMP "AI Fuzzy Select" plugin. Runs in the plugin's own virtual
-environment (made by install_ai_select.py) and stays alive while the plugin window is
-open, so SAM2 is loaded and the image is encoded only once; each click then costs only
-SAM2's small mask decoder.
+environment (made by install_ai_select.py). It stays alive between plugin runs and keeps
+the analysis of recent images, so SAM2 is loaded once and an image is encoded once; each
+click then costs only SAM2's small mask decoder.
 
-Protocol: one JSON object per line on stdin, one JSON reply per line on stdout.
+Two ways to run it:
+  aiselect_server.py SETTINGS_JSON            requests on stdin, replies on stdout
+  aiselect_server.py --listen SETTINGS_JSON   a local server that stays alive between plugin
+      runs (see listen()); the plugin starts it with AISELECT_TOKEN, AISELECT_STATE,
+      AISELECT_LOG and AISELECT_KEEPALIVE in the environment
+
+Protocol: one JSON object per line in each direction. In --listen mode a connection
+starts with {"cmd": "hello", "token": ...}.
   {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h}
       encode the image; "preview" is where render writes its overlay
   {"cmd": "render", "objects": [...], "threshold": 0-100, "granularity": "auto"|"detail"|
@@ -19,12 +26,17 @@ Protocol: one JSON object per line on stdin, one JSON reply per line on stdout.
       Final: write the full-size 8-bit selection to "out" (optionally with ViTMatte edges).
   {"cmd": "hover", "point": [x, y], "threshold": 0-100, "granularity": ...}
       the outline a click there would select: {"polygons": [[[x, y], ...], ...]}
-  {"cmd": "quit"}
+  {"cmd": "bye"}   end this connection (in --listen mode the server waits for the next)
+  {"cmd": "quit"}  stop the server
 Every reply has "id" (echoed from the request) and "ok", plus "error" on failure.
 """
 
+import collections
+import hashlib
+import hmac
 import json
 import os
+import socket
 import sys
 import time
 import traceback
@@ -32,6 +44,10 @@ import traceback
 # Keep stdout for the protocol only; anything libraries print goes to stderr.
 PROTOCOL = sys.stdout
 sys.stdout = sys.stderr
+
+with open(__file__, "rb") as _f:
+    VERSION = hashlib.sha1(_f.read()).hexdigest()[:12]  # lets the plugin spot an outdated server
+IMAGE_CACHE_SIZE = 4  # images whose SAM2 analysis is kept (about 16 MB of GPU memory each)
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -59,6 +75,9 @@ class Server:
         self.vitmatte = None
         self.image = None
         self.cache = {}  # (granularity, points) -> (full-res logits, low-res logits)
+        # SAM2's analysis of recent images, so reopening the window on the same image is
+        # instant: image hash -> (image, predictor state)
+        self.analysed = collections.OrderedDict()
 
     # --- models --------------------------------------------------------------------
 
@@ -103,10 +122,25 @@ class Server:
         self.preview_path = req["preview"]
         self.preview_size = (req["preview_width"], req["preview_height"])
         self.cache.clear()
-        with torch.no_grad():
-            self.predictor.set_image(self.image)
+        key = hashlib.sha1(self.image.tobytes()).hexdigest() + str(self.image.shape)
+        cached = key in self.analysed
+        if cached:
+            self.analysed.move_to_end(key)
+            pred = self.predictor
+            pred._features, pred._orig_hw, pred._is_batch = self.analysed[key]
+            pred._is_image_set = True
+        else:
+            with torch.no_grad():
+                self.predictor.set_image(self.image)
+            if self.device == "cuda":
+                torch.cuda.synchronize()  # the GPU works asynchronously: "ready" must mean ready
+            pred = self.predictor
+            self.analysed[key] = (pred._features, pred._orig_hw, pred._is_batch)
+            while len(self.analysed) > IMAGE_CACHE_SIZE:
+                self.analysed.popitem(last=False)
         h, w = self.image.shape[:2]
-        return {"width": w, "height": h, "seconds": round(time.time() - t0, 2), "device": self.device}
+        return {"width": w, "height": h, "seconds": round(time.time() - t0, 2), "device": self.device,
+                "cached": cached}
 
     def object_logits(self, points, granularity):
         """Full-res mask logits for one object's clicks. The first click picks one of
@@ -308,25 +342,97 @@ class Server:
         cv2.imwrite(path, cv2.cvtColor(overlay, cv2.COLOR_RGBA2BGRA))
 
 
-def main():
-    settings = json.loads(sys.argv[1]) if len(sys.argv) > 1 else {}
-    server = Server(settings)
-    for line in sys.stdin:
+def serve(server, lines, out):
+    """Answer requests from `lines` on `out` until "quit" (returns True) or end of input
+    (returns False)."""
+    for line in lines:
         if not line.strip():
             continue
         req = json.loads(line)
         reply = {"id": req.get("id")}
         try:
-            if req["cmd"] != "quit":
+            if req["cmd"] not in ("quit", "bye"):
                 reply.update(getattr(server, "cmd_" + req["cmd"])(req))
             reply["ok"] = True
         except Exception as e:
             traceback.print_exc()
             reply.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
-        PROTOCOL.write(json.dumps(reply) + "\n")
-        PROTOCOL.flush()
+        out.write(json.dumps(reply) + "\n")
+        out.flush()
         if req["cmd"] == "quit":
-            break
+            return True
+        if req["cmd"] == "bye":
+            return False
+    return False
+
+
+def listen(server, settings):
+    """Stay alive between plugin runs: accept one connection at a time on a local port and
+    exit after AISELECT_KEEPALIVE seconds without one. The port and a random token go to
+    the state file (in the user's own temp folder); a connection must start with that token,
+    so other users on the machine can't use the server to read images or write files."""
+    token = os.environ["AISELECT_TOKEN"]
+    state_file = os.environ["AISELECT_STATE"]
+    keep_alive = float(os.environ.get("AISELECT_KEEPALIVE", "600"))
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    sock.bind(("127.0.0.1", 0))
+    sock.listen(1)
+    state = {"port": sock.getsockname()[1], "pid": os.getpid(), "token": token, "version": VERSION,
+             "settings": settings}
+    tmp = state_file + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(state, f)
+    os.replace(tmp, state_file)
+    print(f"listening on port {state['port']} (pid {os.getpid()}, version {VERSION})", flush=True)
+    try:
+        while True:
+            sock.settimeout(keep_alive)
+            try:
+                conn, _ = sock.accept()
+            except socket.timeout:
+                print(f"idle for {keep_alive:.0f} s, exiting", flush=True)
+                return
+            conn.settimeout(None)
+            with conn, conn.makefile("r", encoding="utf-8", newline="\n") as rfile, \
+                    conn.makefile("w", encoding="utf-8", newline="\n") as wfile:
+                try:
+                    hello = json.loads(rfile.readline() or "{}")
+                    if hello.get("cmd") != "hello" or not hmac.compare_digest(str(hello.get("token", "")), token):
+                        continue
+                    wfile.write(json.dumps({"id": hello.get("id"), "ok": True, "version": VERSION,
+                                            "pid": os.getpid()}) + "\n")
+                    wfile.flush()
+                    if serve(server, rfile, wfile):
+                        print("quit requested", flush=True)
+                        return
+                except (OSError, ValueError):
+                    traceback.print_exc()  # the plugin went away mid-request; wait for the next
+    finally:
+        sock.close()
+        try:  # remove the state file only if it is still ours (closed first: Windows
+            # can't delete an open file)
+            with open(state_file, encoding="utf-8") as f:
+                ours = json.load(f).get("token") == token
+            if ours:
+                os.remove(state_file)
+        except (OSError, ValueError):
+            pass
+
+
+def main():
+    args = sys.argv[1:]
+    listening = args[:1] == ["--listen"]
+    if listening:
+        args = args[1:]
+        log = os.environ.get("AISELECT_LOG")
+        if log:  # no console to write to: log to a file instead
+            sys.stdout = sys.stderr = open(log, "w", encoding="utf-8", buffering=1)
+    settings = json.loads(args[0]) if args else {}
+    server = Server(settings)
+    if listening:
+        listen(server, settings)
+    else:
+        serve(server, sys.stdin, PROTOCOL)
 
 
 if __name__ == "__main__":

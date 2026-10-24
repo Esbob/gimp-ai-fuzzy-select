@@ -24,9 +24,12 @@ runs its small decoder.
 """
 
 import copy
+import hashlib
 import json
 import os
+import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import tempfile
@@ -75,29 +78,99 @@ def load_json(path, default):
 # --- Backend process ----------------------------------------------------------------
 
 
+SERVER_STATE = os.path.join(tempfile.gettempdir(), "aiselect_server.json")
+SERVER_LOG = os.path.join(tempfile.gettempdir(), "aiselect_server.log")
+
+
+def server_version():
+    with open(SERVER, "rb") as f:
+        return hashlib.sha1(f.read()).hexdigest()[:12]
+
+
 class Backend:
-    """Runs aiselect_server.py and talks to it one request at a time on a worker thread.
+    """Talks to aiselect_server.py one request at a time on a worker thread.
+
+    The server stays alive between plugin runs (for keepAliveMinutes, default 10), so SAM2
+    is loaded only once: the first run starts it, later runs reconnect via the port and
+    token in SERVER_STATE. A server from older plugin files, or other settings, is
+    replaced. Connecting happens on the worker thread, so the window appears at once.
+
     Interactive requests can be 'coalesced' by group: a newer request replaces a queued,
     unsent one of the same group (e.g. "preview"), so dragging a slider doesn't build up a
     backlog, while fast previews and slower soft-edge previews don't cancel each other."""
 
     def __init__(self, settings):
-        self.proc = subprocess.Popen(
-            [settings["pythonPath"], SERVER, json.dumps(settings)],
-            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            text=True, encoding="utf-8", errors="replace", bufsize=1,
-            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-        )
-        self.stderr_tail = []
-        threading.Thread(target=self._drain_stderr, daemon=True).start()
+        self.settings = settings
+        self.sock = self.rfile = self.wfile = None
         self.queue = []
         self.cond = threading.Condition()
         self.next_id = 0
         threading.Thread(target=self._worker, daemon=True).start()
 
-    def _drain_stderr(self):
-        for line in self.proc.stderr:
-            self.stderr_tail = (self.stderr_tail + [line])[-20:]
+    # --- connecting ---
+
+    def _connect(self):
+        state = load_json(SERVER_STATE, None)
+        if state and self._try(state):
+            if state.get("version") == server_version() and state.get("settings") == self.settings:
+                return
+            self._send({"cmd": "quit"})  # outdated code or other settings: replace it
+            self._disconnect()
+            time.sleep(0.5)
+        self._start()
+
+    def _try(self, state):
+        try:
+            sock = socket.create_connection(("127.0.0.1", state["port"]), timeout=3)
+            sock.settimeout(None)
+            self.sock = sock
+            self.rfile = sock.makefile("r", encoding="utf-8", newline="\n")
+            self.wfile = sock.makefile("w", encoding="utf-8", newline="\n")
+            reply = self._send({"cmd": "hello", "token": state["token"]})
+            if reply and reply.get("ok"):
+                return True
+        except (OSError, KeyError, ValueError):
+            pass
+        self._disconnect()
+        return False
+
+    def _start(self):
+        token = secrets.token_hex(16)
+        env = dict(os.environ, AISELECT_TOKEN=token, AISELECT_STATE=SERVER_STATE,
+                   AISELECT_LOG=SERVER_LOG,
+                   AISELECT_KEEPALIVE=str(60 * float(self.settings.get("keepAliveMinutes", 10))))
+        kwargs = {"start_new_session": True}
+        if os.name == "nt":  # no console window; not tied to this plugin process
+            kwargs = {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+        proc = subprocess.Popen(
+            [self.settings["pythonPath"], SERVER, "--listen", json.dumps(self.settings)], env=env,
+            stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, **kwargs)
+        t0 = time.time()
+        while time.time() - t0 < 120:
+            state = load_json(SERVER_STATE, None)
+            if state and state.get("token") == token and self._try(state):
+                return
+            if proc.poll() is not None:
+                break
+            time.sleep(0.2)
+        raise RuntimeError("The AI Fuzzy Select backend didn't start.\n\n" + log_tail())
+
+    def _disconnect(self):
+        for f in (self.rfile, self.wfile, self.sock):
+            try:
+                if f:
+                    f.close()
+            except OSError:
+                pass
+        self.sock = self.rfile = self.wfile = None
+
+    def _send(self, req):
+        self.wfile.write(json.dumps(req) + "\n")
+        self.wfile.flush()
+        line = self.rfile.readline()
+        return json.loads(line) if line else None
+
+    # --- requests ---
 
     def request(self, req, callback, coalesce=False, main_loop=True):
         with self.cond:
@@ -131,30 +204,44 @@ class Backend:
                 while not self.queue:
                     self.cond.wait()
                 req, callback, _, main_loop = self.queue.pop(0)
+            reply = None
             try:
-                self.proc.stdin.write(json.dumps(req) + "\n")
-                self.proc.stdin.flush()
-                line = self.proc.stdout.readline()
-                reply = json.loads(line) if line else None
+                if self.sock is None and req.get("cmd") not in ("bye", "quit"):
+                    self._connect()
+                if self.sock is not None:
+                    reply = self._send(req)
+                elif req.get("cmd") in ("bye", "quit"):
+                    reply = {"ok": True}
+            except RuntimeError as e:
+                reply = {"ok": False, "error": str(e)}
             except (OSError, ValueError):
                 reply = None
             if reply is None:
-                tail = "".join(self.stderr_tail).strip()
-                reply = {"ok": False, "error": f"The AI Fuzzy Select backend stopped.\n\n{tail}"}
+                self._disconnect()
+                reply = {"ok": False, "error": "The AI Fuzzy Select backend stopped.\n\n" + log_tail()}
             if main_loop:
                 GLib.idle_add(callback, reply)
             else:
                 callback(reply)
-            if req.get("cmd") == "quit":
+            if req.get("cmd") in ("bye", "quit"):
+                self._disconnect()
                 return
 
     def close(self):
-        if self.proc.poll() is None:
-            self.request({"cmd": "quit"}, lambda r: None, main_loop=False)
-            try:
-                self.proc.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                self.proc.kill()
+        """End this connection; the server stays loaded for the next run (unless
+        keepAliveMinutes is 0)."""
+        stop = float(self.settings.get("keepAliveMinutes", 10)) <= 0
+        done = threading.Event()
+        self.request({"cmd": "quit" if stop else "bye"}, lambda r: done.set(), main_loop=False)
+        done.wait(10)
+
+
+def log_tail(lines=15):
+    try:
+        with open(SERVER_LOG, encoding="utf-8", errors="replace") as f:
+            return "".join(f.readlines()[-lines:]).strip()
+    except OSError:
+        return ""
 
 
 # --- Window -------------------------------------------------------------------------
@@ -945,8 +1032,9 @@ class AISelectDialog(Gtk.Dialog):
             return False
         self.set_busy(None)
         self.ready = True
-        self.set_status(f"Ready ({reply['device']}, analysed in {reply['seconds']} s). "
-                        "Click an object to select it.")
+        how = ("image analysis reused" if reply.get("cached")
+               else f"analysed in {reply['seconds']} s")
+        self.set_status(f"Ready ({reply['device']}, {how}). Click an object to select it.")
         return False
 
     def on_rendered(self, reply, version, soft=False):

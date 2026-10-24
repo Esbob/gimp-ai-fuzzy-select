@@ -6,7 +6,8 @@ Removes:
   * the plug-in folder (plug-ins/aiselect) from every GIMP 3.x profile that has it,
     including the remembered dialog options,
   * the install folder (virtual environment, downloaded sources and checkpoints),
-  * the plug-in's log file (aiselect.log in the temp folder).
+  * the plug-in's log files (aiselect.log and aiselect_server.log in the temp folder),
+after stopping the plug-in's backend if it is still running.
 
 Checkpoints you pointed the installer at with --sam2-checkpoint / --vitmatte-checkpoint
 live outside the install folder and are left alone. It shows what it will delete and
@@ -25,13 +26,52 @@ import argparse
 import json
 import os
 import shutil
+import signal
+import socket
 import stat
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 IS_WINDOWS = os.name == "nt"
 PLUGIN_FOLDER = "aiselect"
+
+
+SERVER_STATE = Path(tempfile.gettempdir()) / "aiselect_server.json"
+SERVER_LOG = Path(tempfile.gettempdir()) / "aiselect_server.log"
+
+
+def stop_backend():
+    """Stop a running AI Fuzzy Select backend (it stays alive between plugin runs and
+    holds files in the virtual environment open). Returns True if one was running."""
+    try:
+        state = json.loads(SERVER_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    stopped = False
+    try:
+        with socket.create_connection(("127.0.0.1", state["port"]), timeout=3) as sock:
+            f = sock.makefile("rw", encoding="utf-8", newline="\n")
+            for req in ({"cmd": "hello", "token": state["token"]}, {"cmd": "quit"}):
+                f.write(json.dumps(req) + "\n")
+                f.flush()
+                f.readline()
+            stopped = True
+    except (OSError, KeyError, ValueError):
+        pass
+    if not stopped and state.get("pid"):
+        try:  # not answering: end the process
+            os.kill(state["pid"], signal.SIGTERM)
+            stopped = True
+        except OSError:
+            pass
+    time.sleep(1)  # let it exit and release its files
+    try:
+        SERVER_STATE.unlink()
+    except OSError:
+        pass
+    return stopped
 
 
 def default_install_dir():
@@ -160,9 +200,9 @@ def main():
             keep_notes.append(f"{install_dir / 'checkpoints'} (--keep-checkpoints)")
         else:
             plan.append((install_dir, "install folder"))
-    log_file = Path(tempfile.gettempdir()) / "aiselect.log"
-    if log_file.exists():
-        plan.append((log_file, "log file"))
+    for log_file in (Path(tempfile.gettempdir()) / "aiselect.log", SERVER_LOG):
+        if log_file.exists():
+            plan.append((log_file, "log file"))
     for key in ("sam2Checkpoint", "vitmatteCheckpoint"):
         ckpt = settings.get(key)
         if ckpt and install_dir not in Path(ckpt).resolve().parents:
@@ -192,6 +232,8 @@ def main():
             print("Cancelled; nothing was removed.")
             return 1
 
+    if stop_backend():
+        print("Stopped the running AI Fuzzy Select backend.")
     leftovers = []
     for path, _ in plan:
         if path.is_dir():

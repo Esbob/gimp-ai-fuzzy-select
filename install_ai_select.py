@@ -29,6 +29,8 @@ import json
 import os
 import platform
 import shutil
+import signal
+import socket
 import subprocess
 import sys
 import tempfile
@@ -229,6 +231,42 @@ def site_packages(py):
 
 
 # --- Install steps ----------------------------------------------------------------
+
+SERVER_STATE = Path(tempfile.gettempdir()) / "aiselect_server.json"
+SERVER_LOG = Path(tempfile.gettempdir()) / "aiselect_server.log"
+
+
+def stop_backend():
+    """Stop a running AI Fuzzy Select backend (it stays alive between plugin runs and
+    holds files in the virtual environment open). Returns True if one was running."""
+    try:
+        state = json.loads(SERVER_STATE.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    stopped = False
+    try:
+        with socket.create_connection(("127.0.0.1", state["port"]), timeout=3) as sock:
+            f = sock.makefile("rw", encoding="utf-8", newline="\n")
+            for req in ({"cmd": "hello", "token": state["token"]}, {"cmd": "quit"}):
+                f.write(json.dumps(req) + "\n")
+                f.flush()
+                f.readline()
+            stopped = True
+    except (OSError, KeyError, ValueError):
+        pass
+    if not stopped and state.get("pid"):
+        try:  # not answering: end the process
+            os.kill(state["pid"], signal.SIGTERM)
+            stopped = True
+        except OSError:
+            pass
+    time.sleep(1)  # let it exit and release its files
+    try:
+        SERVER_STATE.unlink()
+    except OSError:
+        pass
+    return stopped
+
 
 
 def create_venv(venv_dir):
@@ -474,7 +512,8 @@ try:
         while not cond() and time.time() - t < timeout:
             Gtk.main_iteration_do(False); time.sleep(0.005)
         return cond()
-    pump(lambda: False, 0.3)
+    # Checked straight away: with the backend still running from an earlier run and this
+    # image already analysed, loading can finish within a fraction of a second.
     res["sidebar_disabled_while_loading"] = not dlg.sidebar.get_sensitive()
     res["ready"] = pump(lambda: dlg.ready, 300)
     res["sidebar_enabled_after"] = dlg.sidebar.get_sensitive()
@@ -696,6 +735,8 @@ def main():
             soft = bool(settings.get("vitmatteDir") or settings.get("appDir"))
             py = Path(settings["pythonPath"])
         else:
+            if stop_backend():
+                info("Stopped the running AI Fuzzy Select backend (it is restarted on next use)")
             step("Creating virtual environment")
             py = create_venv(install_dir / "venv")
             step(f"Installing PyTorch ({index}) and SAM2")

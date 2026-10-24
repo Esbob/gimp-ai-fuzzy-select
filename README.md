@@ -65,11 +65,25 @@ pixels show as grey.
 
 ### How it works
 
-When the window opens, a backend process (in its own Python environment) loads SAM 2 and
-analyses the image once, which takes roughly 10–20 seconds. After that each click only runs
-SAM 2's small mask decoder, so updates take about 0.05–0.3 seconds (measured on a GeForce
-GTX 1050 Ti from 2018). Clicks are evaluated at SAM 2's working resolution (1024 px on the long
+A backend process (in its own Python environment) loads SAM 2 and analyses the image
+once. After that each click only runs SAM 2's small mask decoder, so updates take about
+0.05–0.3 seconds. Clicks are evaluated at SAM 2's working resolution (1024 px on the long
 side); on large photos use **Soft edges** or **Feather** for fine edges.
+
+The backend stays loaded between runs and remembers the analysis of the last few images,
+so only the first run has to wait for the model. Measured on a GeForce GTX 1050 Ti from
+2018:
+
+| Opening the window | Wait |
+|---|---|
+| First time (loads the model) | about 10 seconds |
+| On another image | about 2–3 seconds (analysing the image) |
+| On an image analysed recently | instant |
+
+It shuts itself down after 10 minutes without use, which frees the video memory it holds
+(about 2 GB with soft edges loaded). To change that, set `"keepAliveMinutes"` in
+`aiselect_settings.json` in the plug-in's folder (0 = stop when the window closes). The
+installer and uninstaller stop a running backend before changing its files.
 
 ## Requirements
 
