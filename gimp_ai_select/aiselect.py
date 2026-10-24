@@ -57,10 +57,18 @@ SERVER = os.path.join(PLUGIN_DIR, "aiselect_server.py")
 PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 
 DEFAULT_OPTIONS = {
-    "hover": True, "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
+    "output": "selection", "hover": True, "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
     "soft": False, "edge": 4, "operation": "replace",
 }
 RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "soft", "edge")
+# Result choices: dropdown text and the label of the dialog's main button.
+OUTPUTS = {
+    "selection": ("Selection", "_Select"),
+    "layer": ("New layer with mask", "_Create layer"),
+    "cutout": ("New layer with only the object", "_Create cut-out"),
+    "mask": ("Mask on current layer", "_Add mask"),
+    "channel": ("Channel", "_Save channel"),
+}
 OPERATIONS = {
     "replace": Gimp.ChannelOps.REPLACE, "add": Gimp.ChannelOps.ADD,
     "subtract": Gimp.ChannelOps.SUBTRACT, "intersect": Gimp.ChannelOps.INTERSECT,
@@ -513,9 +521,26 @@ class AISelectDialog(Gtk.Dialog):
         grid.attach(self.soft, 0, row[0], 2, 1)
         row[0] += 1
 
-        # How to combine with GIMP's existing selection: only meaningful if there is one.
+        heading("Result")
+        self.output = Gtk.ComboBoxText()
+        for key, (text, _) in OUTPUTS.items():
+            self.output.append(key, text)
+        self.output.set_active_id(self.options["output"])
+        self.output.set_tooltip_text(
+            "What the button at the bottom right creates: a selection; a copy of the current "
+            "layer with the result as its layer mask (non-destructive: paint on the mask to fix "
+            "it later); a copy with everything outside the object deleted (a plain cut-out); "
+            "the result as the current layer's mask; or a channel, leaving GIMP's selection alone")
+        self.output.connect("changed", lambda w: self.on_output_changed(w.get_active_id()))
+        side.pack_start(self.output, False, False, 0)
+
+        # How to combine with GIMP's existing selection: only meaningful for a selection
+        # result, and only if there is a selection.
+        self.existing_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=3)
         if self.has_selection:
-            heading("Existing selection in GIMP")
+            label = Gtk.Label(label="Existing selection in GIMP", xalign=0)
+            label.get_style_context().add_class("heading")
+            self.existing_box.pack_start(label, False, False, 0)
             self.operation = Gtk.ComboBoxText()
             for key, text in [("replace", "Replace it"), ("add", "Add to it"),
                               ("subtract", "Subtract from it"), ("intersect", "Intersect with it")]:
@@ -526,7 +551,18 @@ class AISelectDialog(Gtk.Dialog):
                 "selection replaces it, is added to it, is subtracted from it, or keeps only "
                 "where the two overlap")
             self.operation.connect("changed", lambda w: self.options.update(operation=w.get_active_id()))
-            side.pack_start(self.operation, False, False, 0)
+            self.existing_box.pack_start(self.operation, False, False, 0)
+        self.existing_box.set_no_show_all(True)
+        for child in self.existing_box.get_children():
+            child.show()
+        side.pack_start(self.existing_box, False, False, 0)
+
+        reset = Gtk.Button(label="Reset to defaults")
+        reset.set_tooltip_text("Put all options back to their defaults (your clicks are kept). "
+                               "Saved when you confirm with the main button.")
+        reset.connect("clicked", lambda b: self.reset_options())
+        side.pack_start(reset, False, False, 8)
+        GLib.idle_add(lambda: self.on_output_changed(self.options["output"]) and False)
 
         self.status = Gtk.Label(xalign=0)
         self.status.set_line_wrap(True)
@@ -574,6 +610,28 @@ class AISelectDialog(Gtk.Dialog):
 
     def set_status(self, text):
         self.status.set_text(text)
+
+    def reset_options(self):
+        """Every option back to DEFAULT_OPTIONS, through the widgets so the preview follows."""
+        d = DEFAULT_OPTIONS
+        self.hover.set_active(d["hover"])
+        self.granularity.set_active_id(d["granularity"])
+        self.threshold.set_value(d["threshold"])
+        self.fill_holes.set_value(d["fill_holes"])
+        self.grow.set_value(d["grow"])
+        self.feather.set_value(d["feather"])
+        if self.soft_available:
+            self.soft.set_active(d["soft"])
+        self.output.set_active_id(d["output"])
+        if self.has_selection:
+            self.operation.set_active_id(d["operation"])
+        self.options.update(d, soft=d["soft"] and self.soft_available)
+        self.set_status("Options reset to their defaults.")
+
+    def on_output_changed(self, output):
+        self.options["output"] = output
+        self.existing_box.set_visible(output == "selection" and self.has_selection)
+        self.select_button.set_label(OUTPUTS[output][1])
 
     def set_busy(self, message, error=False):
         """Busy: grey the image, disable the sidebar, show a spinner and `message` in the
@@ -1233,35 +1291,109 @@ def export_visible(image, path):
     dup.delete()
 
 
-def apply_selection(image, raw_file, operation):
-    """Turn an 8-bit mask file (image-sized) into GIMP's selection."""
+def write_mask(drawable, data):
+    """Write 8-bit values into a channel or layer mask the drawable's size, in its own colour
+    model so 50% stays 50% ("Y u8" into a Y' channel would gamma-convert partial values)."""
+    w, h = drawable.get_width(), drawable.get_height()
+    fmt = "Y' u8" if Babl.get_name(drawable.get_format()).startswith("Y'") else "Y u8"
+    buffer = drawable.get_buffer()
+    buffer.set(Gegl.Rectangle.new(0, 0, w, h), fmt, data)
+    buffer.flush()
+    drawable.update(0, 0, w, h)
+
+
+def crop_to_layer(data, image_w, image_h, layer):
+    """The part of an image-sized 8-bit mask that falls on `layer`. Layers can be smaller
+    than the image, shifted, or stick out of it; outside the image counts as unselected."""
+    _, ox, oy = layer.get_offsets()
+    lw, lh = layer.get_width(), layer.get_height()
+    out = bytearray(lw * lh)
+    x0, x1 = max(ox, 0), min(ox + lw, image_w)
+    if x1 > x0:
+        for y in range(max(oy, 0), min(oy + lh, image_h)):
+            dst = (y - oy) * lw + (x0 - ox)
+            out[dst:dst + x1 - x0] = data[y * image_w + x0:y * image_w + x1]
+    return bytes(out)
+
+
+class KeepSelectedItems:
+    """GIMP's Channels dock selects a newly added channel, which deselects the user's
+    layers; then Copy etc. silently do nothing. Restore the selected items afterwards."""
+
+    def __init__(self, image):
+        self.image = image
+
+    def __enter__(self):
+        image = self.image
+        self.layers, self.channels = image.get_selected_layers(), image.get_selected_channels()
+        self.paths = image.get_selected_paths()
+
+    def __exit__(self, *exc):
+        image = self.image
+        if self.layers:
+            image.set_selected_layers(self.layers)
+        elif self.channels:
+            image.set_selected_channels(self.channels)
+        if self.paths:  # GIMP rejects an empty list here
+            image.set_selected_paths(self.paths)
+        log(f"selected items restored: layers={[l.get_name() for l in image.get_selected_layers()]} "
+            f"channels={[c.get_name() for c in image.get_selected_channels()]}")
+        return False
+
+
+def apply_selection(image, data, operation):
+    """Turn an image-sized 8-bit mask into GIMP's selection."""
+    w, h = image.get_width(), image.get_height()
+    with KeepSelectedItems(image):
+        channel = Gimp.Channel.new(image, "AI Fuzzy Select", w, h, 100, Gegl.Color.new("black"))
+        channel.set_visible(False)  # a visible channel flashes as an overlay on the canvas
+        image.insert_channel(channel, None, 0)
+        write_mask(channel, data)
+        image.select_item(OPERATIONS[operation], channel)
+        image.remove_channel(channel)
+
+
+def apply_result(image, raw_file, output, operation, layer):
+    """Create what the user chose under Result. `layer` is the layer that was selected
+    when the plugin started (for "layer" and "mask"). Returns an error message or None."""
     w, h = image.get_width(), image.get_height()
     with open(raw_file, "rb") as f:
         data = f.read()
-    # GIMP's Channels dock selects a newly added channel, which deselects the user's
-    # layers; once the temporary channel is removed nothing is selected and Copy etc.
-    # silently do nothing. Remember the selection of items and restore it afterwards.
-    layers, channels = image.get_selected_layers(), image.get_selected_channels()
-    paths = image.get_selected_paths()
-    channel = Gimp.Channel.new(image, "AI Fuzzy Select", w, h, 100, Gegl.Color.new("black"))
-    channel.set_visible(False)  # a visible channel flashes as an overlay on the canvas
-    image.insert_channel(channel, None, 0)
-    # Write in the channel's own colour model so 50% stays 50% (see the Matte Anything
-    # plugin: "Y u8" into a Y' channel would gamma-convert the partial values).
-    fmt = "Y' u8" if Babl.get_name(channel.get_format()).startswith("Y'") else "Y u8"
-    buffer = channel.get_buffer()
-    buffer.set(Gegl.Rectangle.new(0, 0, w, h), fmt, data)
-    buffer.flush()
-    image.select_item(OPERATIONS[operation], channel)
-    image.remove_channel(channel)
-    if layers:
-        image.set_selected_layers(layers)
-    elif channels:
-        image.set_selected_channels(channels)
-    if paths:  # GIMP rejects an empty list here
-        image.set_selected_paths(paths)
-    log(f"selected items restored: layers={[l.get_name() for l in image.get_selected_layers()]} "
-        f"channels={[c.get_name() for c in image.get_selected_channels()]}")
+    if output == "selection":
+        apply_selection(image, data, operation)
+    elif output == "channel":
+        with KeepSelectedItems(image):
+            channel = Gimp.Channel.new(image, "AI Fuzzy Select", w, h, 50, Gegl.Color.new("black"))
+            channel.set_visible(False)
+            image.insert_channel(channel, None, 0)
+            write_mask(channel, data)
+    elif output in ("layer", "cutout"):
+        if layer is not None:  # a copy of the current layer, right above it
+            new = layer.copy()
+            new.set_name(f"{layer.get_name()} (AI Fuzzy Select)")
+            image.insert_layer(new, layer.get_parent(), image.get_item_position(layer))
+        else:  # no layer selected: what's visible
+            new = Gimp.Layer.new_from_visible(image, image, "AI Fuzzy Select")
+            image.insert_layer(new, None, 0)
+        mask = new.get_mask()  # a copied layer may bring its own mask; replace its contents
+        if mask is None:
+            mask = new.create_mask(Gimp.AddMaskType.WHITE)
+            new.add_mask(mask)
+        write_mask(mask, crop_to_layer(data, w, h, new))
+        if output == "cutout":  # make it permanent: everything outside the object deleted
+            if not new.has_alpha():
+                new.add_alpha()
+            new.remove_mask(Gimp.MaskApplyMode.APPLY)
+        image.set_selected_layers([new])
+    elif output == "mask":
+        if layer is None:
+            return "Select a layer first: \"Mask on current layer\" needs one."
+        mask = layer.get_mask()  # an existing mask gets the new contents
+        if mask is None:
+            mask = layer.create_mask(Gimp.AddMaskType.WHITE)
+            layer.add_mask(mask)
+        write_mask(mask, crop_to_layer(data, w, h, layer))
+    return None
 
 
 def preview_size(w, h):
@@ -1325,6 +1457,8 @@ def ai_select_steps(procedure, run_mode, image, config):
         # Without an existing selection, "Existing selection in GIMP" is hidden and the result simply
         # becomes the selection; the remembered choice is kept for next time.
         has_selection = Gimp.Selection.bounds(image)[1]
+        selected_layers = image.get_selected_layers()
+        layer = selected_layers[0] if selected_layers else None  # for "layer"/"mask" results
 
         if run_mode == Gimp.RunMode.INTERACTIVE:
             GimpUi.init("aiselect")
@@ -1345,7 +1479,7 @@ def ai_select_steps(procedure, run_mode, image, config):
                 json.dump(options, f)
         else:  # scripted use: the clicks come as JSON in the "objects" argument
             objects = json.loads(config.get_property("objects") or "[]")
-            for key in ("threshold", "granularity", "grow", "feather", "soft", "operation"):
+            for key in ("threshold", "granularity", "grow", "feather", "soft", "operation", "output"):
                 options[key] = config.get_property(key)
             options["fill_holes"] = config.get_property("fill-holes")
             reply = backend.call({"cmd": "load", "image": image_png, "preview": preview_png,
@@ -1353,7 +1487,7 @@ def ai_select_steps(procedure, run_mode, image, config):
             if not reply["ok"]:
                 return reply["error"]
 
-        Gimp.progress_init("AI Fuzzy Select: creating selection...")
+        Gimp.progress_init("AI Fuzzy Select: creating the result...")
         out = os.path.join(work, "selection.raw")
         req = {"cmd": "render", "objects": objects, "final": True, "out": out}
         for key in RENDER_OPTIONS:
@@ -1365,14 +1499,19 @@ def ai_select_steps(procedure, run_mode, image, config):
             return reply["error"]
         if reply.get("area", 0) == 0:
             return "The selection came out empty (try a higher Threshold or another click)."
+        output = options.get("output", "selection")
+        if output not in OUTPUTS:
+            return f"Unknown result type {output!r}."
         image.undo_group_start()
         try:
             interactive = run_mode == Gimp.RunMode.INTERACTIVE
             operation = options["operation"] if has_selection or not interactive else "replace"
-            apply_selection(image, out, operation)
+            error = apply_result(image, out, output, operation, layer)
         finally:
             image.undo_group_end()
-        log(f"applied ({operation}): {selection_summary(image)}")
+        if error:
+            return error
+        log(f"applied ({output}, {operation}): {selection_summary(image)}")
         Gimp.displays_flush()
         return None
     finally:
@@ -1415,6 +1554,8 @@ class AISelect(Gimp.PlugIn):
         procedure.add_boolean_argument("soft", "Soft edges", "ViTMatte soft edges", False, rw)
         procedure.add_string_argument("operation", "Operation", "replace, add, subtract or intersect",
                                       "replace", rw)
+        procedure.add_string_argument("output", "Result", "selection, layer, cutout, mask or channel",
+                                      "selection", rw)
         return procedure
 
     def run(self, procedure, run_mode, image, drawables, config, data):

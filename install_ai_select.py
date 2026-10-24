@@ -476,14 +476,19 @@ try:
     w, h = img.get_width(), img.get_height()
     proc = Gimp.get_pdb().lookup_procedure("plug-in-ai-select")
     report["registered"] = proc is not None
-    def ai_select(operation):
+    def ai_select(operation, output="selection"):
         cfg = proc.create_config()
         cfg.set_property("run-mode", Gimp.RunMode.NONINTERACTIVE)
         cfg.set_property("image", img)
         cfg.set_core_object_array("drawables", img.get_layers())
         cfg.set_property("objects", json.dumps([{"sign": 1, "points": [[400, 300, 1]]}]))
         cfg.set_property("operation", operation)
+        cfg.set_property("output", output)
         return str(proc.run(cfg).index(0))
+    def value(drawable, x, y):
+        f = "Y' u8" if Babl.get_name(drawable.get_format()).startswith("Y'") else "Y u8"
+        return bytes(drawable.get_buffer().get(Gegl.Rectangle.new(x, y, 1, 1), 1.0, f,
+                                               Gegl.AbyssPolicy.NONE))[0]
     report["status"] = ai_select("replace")
     # Before Selection.save, which selects the channel it creates.
     report["layer_still_selected"] = [l.get_name() for l in img.get_selected_layers()]
@@ -495,6 +500,21 @@ try:
     report["status_add"] = ai_select("add")
     report["add_keeps_old"] = Gimp.Selection.value(img, 20, 20) == 255
     report["add_has_disc"] = Gimp.Selection.value(img, 400, 300) == 255
+    # Other results: a new layer with the result as its mask, and a channel.
+    ai_select("replace", "layer")
+    new = img.get_layers()[0]
+    report["layer_result"] = (len(img.get_layers()) == 2 and new.get_mask() is not None
+                              and value(new.get_mask(), 400, 300) == 255 and value(new.get_mask(), 5, 5) == 0)
+    ai_select("replace", "cutout")
+    cut = img.get_layers()[0]
+    alpha = lambda x, y: bytes(cut.get_buffer().get(Gegl.Rectangle.new(x, y, 1, 1), 1.0, "R'G'B'A u8",
+                                                     Gegl.AbyssPolicy.NONE))[3]
+    report["cutout_result"] = (len(img.get_layers()) == 3 and cut.get_mask() is None
+                               and alpha(400, 300) == 255 and alpha(5, 5) == 0)
+    ai_select("replace", "channel")
+    ours = [c for c in img.get_channels() if c.get_name().startswith("AI Fuzzy Select")]
+    report["channel_result"] = (len(ours) == 1 and value(ours[0], 400, 300) == 255
+                                and bool(img.get_selected_layers()))
     img.delete()
 except Exception:
     import traceback
@@ -627,11 +647,14 @@ def run_gimp_test(py, gimp_console, work):
              "print(float(np.abs(m - t).mean()))")
     mae = float(run([py, "-c", score, Path(work, "alpha_true.npy"), args["mask_out"]], capture=True))
     passed = (mae < 0.03 and report.get("add_keeps_old") and report.get("add_has_disc")
-              and bool(report.get("layer_still_selected")))
+              and bool(report.get("layer_still_selected")) and report.get("layer_result")
+              and report.get("cutout_result") and report.get("channel_result"))
     (ok if passed else fail)(
         f"in GIMP: a click gave a selection with error {mae:.4f}; the layer stayed selected: "
         f"{bool(report.get('layer_still_selected'))}; 'add' kept the old selection: "
-        f"{report.get('add_keeps_old')} and added the object: {report.get('add_has_disc')} "
+        f"{report.get('add_keeps_old')} and added the object: {report.get('add_has_disc')}; "
+        f"new layer with mask: {report.get('layer_result')}; cut-out: {report.get('cutout_result')}; "
+        f"channel: {report.get('channel_result')} "
         f"({time.time() - t0:.0f} s incl. GIMP start)")
     return bool(passed)
 

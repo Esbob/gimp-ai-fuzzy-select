@@ -11,7 +11,8 @@ out which pixels belong to it. The result is a normal GIMP selection with marchi
 
 **Select > AI Fuzzy Select...** opens a window with your image (what is currently visible) and a
 compact options sidebar. GIMP plug-ins can't receive clicks on the canvas itself, so you
-click in this window; when you press **Select**, the result becomes GIMP's selection.
+click in this window; when you press **Select**, the result becomes GIMP's selection (or, if you
+choose, a new layer with a mask, a cut-out layer, a mask on the current layer, or a channel).
 
 ### Clicking and dragging
 
@@ -55,9 +56,11 @@ is held.
 | Grow/shrink | Grow or shrink the selection, in pixels |
 | Feather | Soften the selection edge, in pixels |
 | Soft edges (ViTMatte) | Turn fuzzy edges such as fur and hair into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte), picking out individual hairs near the object's outline. On hard edges it mostly makes the outline smoother and more accurate. The effect is best seen in the **Mask** view. The preview shows soft edges a moment after each change; pressing **Select** computes them at full resolution |
-| Existing selection in GIMP | Only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
+| Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; or a **Channel**, leaving GIMP's selection alone. The button's label changes to match |
+| Existing selection in GIMP | Only for a Selection result, and only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
-Your options are remembered between runs.
+Your options are remembered between runs (saved when you confirm with the main button);
+**Reset to defaults** at the bottom of the options puts them all back.
 
 ### Viewing
 
