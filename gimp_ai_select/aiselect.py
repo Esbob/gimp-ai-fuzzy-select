@@ -7,16 +7,18 @@ the object you click on, using SAM2. GIMP plugins can't receive clicks on the ca
 the clicking happens in the plugin's own window, with a live preview:
 
     click           select the object under the cursor
-    Shift+click     add the clicked part   (Combine mode: add another object)
-    Ctrl+click      remove the clicked part (Combine mode: subtract that object)
+    Shift+click     add the object (or part) under the cursor
+    Ctrl+click      subtract the object (or part) under the cursor
     Ctrl+Z          undo the last click     Ctrl+scroll: zoom
+
+Whether a click means a whole object or a part of it follows the Granularity option.
 
 "Select" turns the result into a normal GIMP selection (replacing, adding to,
 subtracting from or intersecting the current one), with optional grow/shrink,
 feathering and ViTMatte soft edges.
 
-The models run in Matte Anything's Python environment through aiselect_server.py, which
-stays alive while the window is open: SAM2 encodes the image once, then each click only
+The models run in the plugin's own Python environment (made by install_ai_select.py)
+through aiselect_server.py, which stays alive while the window is open: SAM2 encodes the image once, then each click only
 runs its small decoder.
 """
 
@@ -51,7 +53,7 @@ SERVER = os.path.join(PLUGIN_DIR, "aiselect_server.py")
 PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 
 DEFAULT_OPTIONS = {
-    "mode": "refine", "granularity": "auto", "threshold": 50, "fill_holes": 12, "grow": 0, "feather": 0,
+    "granularity": "auto", "threshold": 50, "fill_holes": 12, "grow": 0, "feather": 0,
     "soft": False, "edge": 4, "operation": "replace",
 }
 RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "soft", "edge")
@@ -321,16 +323,6 @@ class AISelectDialog(Gtk.Dialog):
         side.pack_start(help_label, False, False, 0)
 
         heading("Clicks")
-        self.mode_refine = Gtk.RadioButton.new_with_label_from_widget(None, "Refine one object")
-        self.mode_refine.set_tooltip_text(
-            "Shift/Ctrl+click give SAM2 extra include/exclude hints for the same object")
-        mode_combine = Gtk.RadioButton.new_with_label_from_widget(self.mode_refine,
-                                                                 "Combine separate objects")
-        mode_combine.set_tooltip_text("Shift+click adds another object, Ctrl+click subtracts one")
-        (mode_combine if self.options["mode"] == "combine" else self.mode_refine).set_active(True)
-        self.mode_refine.connect("toggled", self.on_mode)
-        side.pack_start(self.mode_refine, False, False, 0)
-        side.pack_start(mode_combine, False, False, 0)
         buttons = Gtk.Box(spacing=4)
         for text, handler in [("Undo", lambda b: self.undo()), ("Clear", lambda b: self.clear())]:
             button = Gtk.Button(label=text)
@@ -366,7 +358,9 @@ class AISelectDialog(Gtk.Dialog):
             self.granularity.append(key, text)
         self.granularity.set_active_id(self.options["granularity"])
         self.granularity.connect("changed", lambda w: self.option_changed("granularity", w.get_active_id()))
-        add_row("Granularity", self.granularity, "Which of SAM2's three suggestions the first click uses")
+        add_row("Granularity", self.granularity,
+                "Whether each click selects, adds or subtracts a whole object or a part of it: "
+                "SAM2's best guess (Auto), the whole object, a part or a detail")
 
         self.threshold = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 1)
         self.threshold.set_value(self.options["threshold"])
@@ -636,18 +630,18 @@ class AISelectDialog(Gtk.Dialog):
     # --- clicks ---
 
     def add_click(self, point, shift=False, ctrl=False):
-        """Update the prompt like Fuzzy Select: plain click replaces, Shift adds, Ctrl removes."""
+        """Like Fuzzy Select: a plain click starts over with the object under the cursor,
+        Shift adds the object (or part) under the cursor and Ctrl subtracts it. Each click
+        is its own SAM2 prompt; Granularity decides whether it means a whole object or a
+        part."""
+        if ctrl and not self.objects:
+            return  # nothing to remove from
         self.history.append(copy.deepcopy(self.objects))
-        combine = self.options["mode"] == "combine"
-        if not self.objects or not (shift or ctrl):
-            if ctrl:  # nothing to remove from
-                self.history.pop()
-                return
-            self.objects = [{"sign": 1, "points": [point + [1]]}]
-        elif combine:
-            self.objects.append({"sign": -1 if ctrl else 1, "points": [point + [1]]})
+        clicked = {"sign": -1 if ctrl else 1, "points": [point + [1]]}
+        if shift or ctrl:
+            self.objects.append(clicked)
         else:
-            self.objects[-1]["points"].append(point + [0 if ctrl else 1])
+            self.objects = [clicked]
         self.render()
 
     def undo(self):
@@ -726,8 +720,6 @@ class AISelectDialog(Gtk.Dialog):
             return False
         return True
 
-    def on_mode(self, button):
-        self.options["mode"] = "refine" if self.mode_refine.get_active() else "combine"
 
     def option_changed(self, key, value):
         self.options[key] = value

@@ -15,28 +15,26 @@ click in this window; when you press **Select**, the result becomes GIMP's selec
 
 | Action | Effect |
 |---|---|
-| Click | Select the object under the cursor (replaces the current clicks) |
-| Shift+click | Add the clicked part |
-| Ctrl+click (or right-click) | Remove the clicked part |
+| Click | Select the object under the cursor (starts over) |
+| Shift+click | Add the object (or part) under the cursor |
+| Ctrl+click (or right-click) | Subtract the object (or part) under the cursor |
 | Ctrl+Z | Undo the last click |
+
+As with Fuzzy Select, each click picks out an object (or part) of its own, and Shift/Ctrl
+add it to or subtract it from what you have so far. Whether a click means the whole object
+or a part of it follows the **Granularity** option: with *Auto* a click usually means the
+whole object, so to remove just a piece of an object with Ctrl+click, switch Granularity
+to *Part* or *Detail* first.
 
 The selection is previewed live as a tinted overlay with a dashed outline. The cursor looks
 like GIMP's Fuzzy Select cursor and shows **+** while Shift is held and **−** while Ctrl
 is held.
 
-There are two ways to handle Shift/Ctrl clicks:
-
-- **Refine one object** (default): extra clicks are include/exclude hints that make SAM 2
-  recompute the same object. This is usually the quickest way to fix a missing branch or
-  an extra bit of background. If SAM 2 ignores a hint, the plug-in still adds or removes
-  the segment at the clicked spot, so a click always does what it says.
-- **Combine separate objects**: Shift+click adds another object, Ctrl+click subtracts one.
-
 ### Options
 
 | Option | What it does |
 |---|---|
-| Granularity | Auto, Whole object, Part or Detail: which of SAM 2's suggestions the first click uses (e.g. tree → crown → branch) |
+| Granularity | Auto, Whole object, Part or Detail: whether each click selects, adds or subtracts a whole object or a part of it (e.g. tree → crown → branch) |
 | Threshold | Like Fuzzy Select's threshold: higher selects more, lower selects less (50 = SAM 2's own cut-off) |
 | Fill holes | Fill enclosed holes up to this size in pixels; 0 keeps every hole (e.g. sky between branches) |
 | Grow/shrink | Grow or shrink the selection, in pixels |

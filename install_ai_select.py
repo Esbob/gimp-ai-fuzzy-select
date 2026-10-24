@@ -390,8 +390,12 @@ hard = final(click)
 res["mae_click"] = float(np.abs(hard - true).mean())
 res["threshold_areas"] = [call(cmd="render", objects=click, threshold=t, preview_out=os.path.join(work, "p2.png"))["area"]
                           for t in (10, 50, 90)]
-res["shift_adds_spot"] = bool(final([{"sign": 1, "points": [[400, 300, 1], [700, 80, 1]]}])[80, 700] > 0.5)
-res["ctrl_removes_spot"] = bool(final([{"sign": 1, "points": [[400, 300, 1], [400, 250, 0]]}])[250, 400] < 0.5)
+# As the window sends them: each click is its own object; Shift adds, Ctrl subtracts.
+added = final([{"sign": 1, "points": [[400, 300, 1]]}, {"sign": 1, "points": [[700, 80, 1]]}])
+res["shift_adds_spot"] = bool(added[80, 700] > 0.5 and added[300, 400] > 0.5)
+removed = final([{"sign": 1, "points": [[700, 80, 1]]}, {"sign": 1, "points": [[400, 300, 1]]},
+                 {"sign": -1, "points": [[400, 250, 1]]}])
+res["ctrl_removes_spot"] = bool(removed[250, 400] < 0.5 and removed[80, 700] > 0.5)
 res["grow_bigger"] = bool((final(click, grow=5) > 0.5).sum() > (hard > 0.5).sum())
 f = final(click, feather=10)
 res["feather_soft_px"] = int(((f > 0.02) & (f < 0.98)).sum())
@@ -481,7 +485,7 @@ try:
     res["click"] = click(400, 300)
     res["shift_click"] = click(700, 80, Gdk.ModifierType.SHIFT_MASK)
     res["ctrl_click"] = click(400, 250, Gdk.ModifierType.CONTROL_MASK)
-    res["points"] = [p[2] for p in dlg.objects[-1]["points"]]
+    res["objects"] = [o["sign"] for o in dlg.objects]
     e = Gdk.Event.new(Gdk.EventType.KEY_PRESS); e.key.keyval = Gdk.KEY_Shift_L; e.key.state = 0
     dlg.on_key(dlg, e.key)
     res["shift_cursor"] = dlg.area.get_window().get_cursor() is dlg.cursors.get("+")
@@ -512,8 +516,8 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (r["mae_click"] < 0.03, f"click selects the object (error vs true alpha {r['mae_click']:.4f})"),
         (r["threshold_areas"] == sorted(r["threshold_areas"]),
          f"higher threshold selects more {r['threshold_areas']}"),
-        (r["shift_adds_spot"], "Shift+click adds the clicked spot"),
-        (r["ctrl_removes_spot"], "Ctrl+click removes the clicked spot"),
+        (r["shift_adds_spot"], "Shift+click adds the clicked object, keeping the first"),
+        (r["ctrl_removes_spot"], "Ctrl+click subtracts the clicked object, keeping the rest"),
         (r["grow_bigger"], "grow enlarges the selection"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
     ]
@@ -575,11 +579,11 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
         print(textwrap.indent(r["exception"].strip(), "      "))
         return False
     passed = (r["sidebar_disabled_while_loading"] and r["ready"] and r["sidebar_enabled_after"]
-              and "selected" in r["click"] and r["points"] == [1, 1, 0] and r["shift_cursor"]
+              and "selected" in r["click"] and r["objects"] == [1, 1, -1] and r["shift_cursor"]
               and r["select_enabled"])
     (ok if passed else fail)(
         f"window: options disabled while loading {r['sidebar_disabled_while_loading']}, ready "
-        f"{r['ready']}; click/Shift/Ctrl recorded as {r['points']}; '+' cursor with Shift "
+        f"{r['ready']}; click/Shift/Ctrl gave objects {r['objects']}; '+' cursor with Shift "
         f"{r['shift_cursor']}; status: {r['ctrl_click']!r}")
     return bool(passed)
 
