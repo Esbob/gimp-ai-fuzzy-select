@@ -214,7 +214,7 @@ class AISelectDialog(Gtk.Dialog):
         self.build_ui()
         self.connect("key-press-event", self.on_key)
         self.connect("key-release-event", self.on_key_release)
-        self.set_busy("Loading SAM2 and analysing the image...")
+        self.set_busy("Loading model and analysing image...")
         self.backend.request({"cmd": "load", "image": image_png, "preview": preview_png,
                               "preview_width": preview_size[0], "preview_height": preview_size[1]},
                              self.on_loaded)

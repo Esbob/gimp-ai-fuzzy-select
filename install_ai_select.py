@@ -465,7 +465,7 @@ try:
                             soft_available=ai.soft_edges_available(settings))
     box = dlg.get_child(); dlg.remove(box)
     off = Gtk.OffscreenWindow(); off.set_size_request(1400, 900); off.add(box); off.show_all()
-    dlg.set_busy("Loading SAM2 and analysing the image...")
+    dlg.set_busy("Loading model and analysing image...")
     def pump(cond, timeout):
         t = time.time()
         while not cond() and time.time() - t < timeout:

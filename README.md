@@ -56,7 +56,7 @@ button.
 When the window opens, a backend process (in its own Python environment) loads SAM 2 and
 analyses the image once, which takes roughly 10–20 seconds. After that each click only runs
 SAM 2's small mask decoder, so updates take about 0.05–0.3 seconds (measured on a GeForce
-GTX 1050 Ti). Clicks are evaluated at SAM 2's working resolution (1024 px on the long
+GTX 1050 Ti from 2018). Clicks are evaluated at SAM 2's working resolution (1024 px on the long
 side); on large photos use **Soft edges** or **Feather** for fine edges.
 
 ## Requirements
@@ -66,7 +66,7 @@ side); on large photos use **Soft edges** or **Feather** for fine edges.
 - **Python 3.10–3.13, 64-bit**, to run the installer. The plug-in's backend runs in a
   virtual environment the installer creates with this Python; GIMP's own Python is not
   used for the models.
-- **An NVIDIA GPU is strongly recommended.** Tested on a GeForce GTX 1050 Ti with 4 GB of
+- **An NVIDIA GPU is strongly recommended.** Tested on a GeForce GTX 1050 Ti (2018) with 4 GB of
   video memory (driver 581.57). Older GPUs (compute capability below 7.5, e.g. GTX 10xx)
   get PyTorch's CUDA 12.6 build and newer ones the CUDA 13 build, so the NVIDIA driver must
   support that CUDA version. Without an NVIDIA GPU everything runs on the CPU; this is
