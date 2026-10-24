@@ -399,6 +399,7 @@ np.save(os.path.join(sys.argv[1], "alpha_true.npy"), true_alpha)
 # Drives aiselect_server.py over its protocol like the plugin window does.
 BACKEND_TEST = r"""
 import json, os, subprocess, sys, time
+import cv2
 import numpy as np
 work, server, settings, soft = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4] == "1"
 true = np.load(os.path.join(work, "alpha_true.npy"))
@@ -436,6 +437,19 @@ removed = final([{"sign": 1, "points": [[700, 80, 1]]}, {"sign": 1, "points": [[
 res["ctrl_removes_spot"] = bool(removed[250, 400] < 0.5 and removed[80, 700] > 0.5)
 res["mae_box"] = float(np.abs(final([{"sign": 1, "box": [240, 140, 560, 460]}]) - true).mean())
 hover = call(cmd="hover", point=[400, 300], threshold=50, granularity="auto")
+# A rough lasso (a circle 60 px too big, off-centre) standing in for the GIMP selection.
+lasso = np.zeros(true.shape, np.uint8)
+cv2.circle(lasso, (415, 290), 210, 255, -1)
+lasso.tofile(os.path.join(work, "lasso.raw"))
+guide = call(cmd="load", image=os.path.join(work, "input.png"), preview=os.path.join(work, "p.png"),
+             preview_width=400, preview_height=300, guide=os.path.join(work, "lasso.raw"))["guide"]
+res["mae_guide"] = float(np.abs(final([{"sign": 1, "box": g["box"], "points": [g["point"] + [1]]}
+                                        for g in guide["prompts"]]) - true).mean())
+# Two separate areas (the disc, and a patch of sky) must give two prompts.
+cv2.rectangle(lasso, (650, 40), (760, 120), 255, -1)
+lasso.tofile(os.path.join(work, "lasso.raw"))
+res["guide_areas"] = len(call(cmd="load", image=os.path.join(work, "input.png"), preview=os.path.join(work, "p.png"),
+                              preview_width=400, preview_height=300, guide=os.path.join(work, "lasso.raw"))["guide"]["prompts"])
 res["hover_outline"] = len(hover["polygons"]) > 0 and int((hard > 0.5).sum()) == hover["area"]
 res["grow_bigger"] = bool((final(click, grow=5) > 0.5).sum() > (hard > 0.5).sum())
 f = final(click, feather=10)
@@ -574,6 +588,8 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (r["ctrl_removes_spot"], "Ctrl+click subtracts the clicked object, keeping the rest"),
         (r["mae_box"] < 0.03, f"a box around the object selects it (error vs true alpha {r['mae_box']:.4f})"),
         (r["hover_outline"], "hovering outlines exactly what a click there selects"),
+        (r["mae_guide"] < 0.03, f"a rough GIMP selection finds the object inside it (error vs true alpha {r['mae_guide']:.4f})"),
+        (r["guide_areas"] == 2, f"a GIMP selection with two separate areas gives one prompt each ({r['guide_areas']})"),
         (r["grow_bigger"], "grow enlarges the selection"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
     ]

@@ -12,13 +12,17 @@ Two ways to run it:
 
 Protocol: one JSON object per line in each direction. In --listen mode a connection
 starts with {"cmd": "hello", "token": ...}.
-  {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h}
-      encode the image; "preview" is where render writes its overlay
+  {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h,
+   "guide": raw}
+      encode the image; "preview" is where render writes its overlay. "guide": the user's
+      GIMP selection (8-bit, image size); the reply's "guide" then has "prompts" (a "box"
+      and "point" for the object in each separate area) and its "polygons" outline
   {"cmd": "render", "objects": [...], "threshold": 0-100, "granularity": "auto"|"detail"|
    "part"|"whole", "fill_holes": px, "grow": px, "feather": px, "soft": false,
    "final": false, "soft_preview": false, "out": raw, "preview_out": png}
       objects: [{"sign": 1 or -1, "points": [[x, y, label], ...]} or
-                {"sign": 1 or -1, "box": [x1, y1, x2, y2]}, ...] in image pixels;
+                {"sign": 1 or -1, "box": [x1, y1, x2, y2], "points": [[x, y, 1]] (optional)},
+                ...] in image pixels;
       the selection is (union of sign 1 objects) minus (union of sign -1 objects).
       Not final: write a tinted preview overlay PNG with an outline to "preview_out"
       (with "soft" and "soft_preview": ViTMatte edges computed at reduced size;
@@ -139,8 +143,11 @@ class Server:
             while len(self.analysed) > IMAGE_CACHE_SIZE:
                 self.analysed.popitem(last=False)
         h, w = self.image.shape[:2]
-        return {"width": w, "height": h, "seconds": round(time.time() - t0, 2), "device": self.device,
-                "cached": cached}
+        reply = {"width": w, "height": h, "seconds": round(time.time() - t0, 2),
+                 "device": self.device, "cached": cached}
+        if req.get("guide"):
+            reply["guide"] = self.guide_prompt(req["guide"])
+        return reply
 
     def object_logits(self, points, granularity):
         """Full-res mask logits for one object's clicks. The first click picks one of
@@ -191,8 +198,30 @@ class Server:
         cut = (50 - req.get("threshold", 50)) / 25.0
         logits, _ = self.single_click(req["point"], req.get("granularity", "auto"))
         mask = logits > cut
+        return {"point": req["point"], "polygons": self.outline(mask), "area": int(mask.sum()),
+                "seconds": round(time.time() - t0, 3)}
+
+    def box_logits(self, box, point=None):
+        """Full-res mask logits for the object inside a box [x1, y1, x2, y2], optionally
+        with a click [x, y] inside it. SAM2 recommends a single output for box prompts: the
+        box already says how big the object is, so Granularity doesn't apply."""
+        key = ("box", tuple(box), tuple(point) if point else None)
+        if key not in self.cache:
+            kwargs = {}
+            if point:
+                kwargs = {"point_coords": np.array([point], dtype=np.float32),
+                          "point_labels": np.array([1])}
+            with torch.no_grad():
+                masks, _, low = self.predictor.predict(
+                    box=np.array(box, dtype=np.float32), multimask_output=False,
+                    return_logits=True, **kwargs)
+            self.cache[key] = (masks[0], low[0])
+        return self.cache[key][0]
+
+    def outline(self, mask):
+        """A mask's outline as polygons in image pixels, traced at preview resolution."""
         h, w = mask.shape
-        pw, ph = self.preview_size  # outline detail at preview resolution is plenty
+        pw, ph = self.preview_size
         small = cv2.resize(mask.astype(np.uint8), (pw, ph), interpolation=cv2.INTER_NEAREST)
         contours, _ = cv2.findContours(small, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
         sx, sy = w / pw, h / ph
@@ -201,20 +230,35 @@ class Server:
             c = cv2.approxPolyDP(c, 0.8, True)[:, 0]
             if len(c) >= 3:
                 polygons.append([[round(float(x) * sx, 1), round(float(y) * sy, 1)] for x, y in c])
-        return {"point": req["point"], "polygons": polygons, "area": int(mask.sum()),
-                "seconds": round(time.time() - t0, 3)}
+        return polygons
 
-    def box_logits(self, box):
-        """Full-res mask logits for the object inside a dragged box [x1, y1, x2, y2]. SAM2
-        recommends a single output for box prompts: the box already says how big the
-        object is, so Granularity doesn't apply."""
-        key = ("box", tuple(box))
-        if key not in self.cache:
-            with torch.no_grad():
-                masks, _, low = self.predictor.predict(
-                    box=np.array(box, dtype=np.float32), multimask_output=False, return_logits=True)
-            self.cache[key] = (masks[0], low[0])
-        return self.cache[key][0]
+    def guide_prompt(self, path):
+        """Turn the user's GIMP selection (a rough lasso, say) into a prompt: its bounding
+        box plus a click at the point deepest inside it. On rough lassos around trunks in
+        a forest photo this matched the object best (IoU 0.82 on average, 0.97-0.99 on the
+        clear trunks); passing the lasso itself as SAM2's mask input did much worse (0.48),
+        as SAM2 then follows the lasso's shape instead of the object.
+
+        Each separate area of the selection is its own lasso (a selection around a tree and
+        a bench gives two prompts): one box and point for all of them made the box cover
+        both and put the point in the tree only. Specks smaller than 0.05% of the image
+        are ignored, unless that leaves nothing."""
+        h, w = self.image.shape[:2]
+        guide = np.fromfile(path, np.uint8).reshape(h, w) > 127
+        if not guide.any():
+            return None
+        n, labels, stats, _ = cv2.connectedComponentsWithStats(guide.astype(np.uint8), connectivity=8)
+        areas = stats[1:, cv2.CC_STAT_AREA]
+        keep = [i + 1 for i in np.argsort(-areas) if areas[i] >= max(100, 0.0005 * h * w)]
+        keep = keep or [int(np.argmax(areas)) + 1]
+        prompts = []
+        for i in keep:
+            x, y, bw, bh = (int(v) for v in stats[i, :4])
+            part = (labels[y:y + bh, x:x + bw] == i).astype(np.uint8)
+            dist = cv2.distanceTransform(np.pad(part, 1), cv2.DIST_L2, 5)[1:-1, 1:-1]
+            py, px = np.unravel_index(int(np.argmax(dist)), dist.shape)
+            prompts.append({"box": [x, y, x + bw, y + bh], "point": [x + int(px), y + int(py)]})
+        return {"prompts": prompts, "polygons": self.outline(guide)}
 
     def selection(self, req):
         """Combined boolean mask, before grow/feather."""
@@ -229,7 +273,8 @@ class Server:
         for obj in req["objects"]:
             points = obj.get("points", [])
             if obj.get("box"):
-                mask = self.box_logits(obj["box"]) > cut
+                point = points[0][:2] if points else None  # e.g. from the GIMP selection
+                mask = self.box_logits(obj["box"], point) > cut
                 points = []  # a box object has no refinement clicks
             elif points:
                 mask = self.object_logits(points, granularity) > cut

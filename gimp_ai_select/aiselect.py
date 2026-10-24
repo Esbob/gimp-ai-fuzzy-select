@@ -271,7 +271,7 @@ class AISelectDialog(Gtk.Dialog):
     `zoom` is screen pixels per image pixel, as in GIMP."""
 
     def __init__(self, backend, image_png, image_size, preview_png, preview_size, options,
-                 soft_available=True, has_selection=True):
+                 soft_available=True, has_selection=True, guide_raw=None):
         super().__init__(title="AI Fuzzy Select", modal=True)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
         self.select_button = self.add_button("_Select", Gtk.ResponseType.OK)
@@ -300,6 +300,7 @@ class AISelectDialog(Gtk.Dialog):
         self.soft_timer = None
         self.pan_start = None
         self.drag = None  # a left/right button press in progress: click or box
+        self.guide = None  # prompt for the object inside GIMP's selection, and its outline
         # Hover preview: the outline a click under the mouse would select.
         self.hover_target = None  # image point under the mouse, or None
         self.hover_polygons = None  # outline for the last hover reply
@@ -312,9 +313,11 @@ class AISelectDialog(Gtk.Dialog):
         self.connect("key-press-event", self.on_key)
         self.connect("key-release-event", self.on_key_release)
         self.set_busy("Loading model and analysing image...")
-        self.backend.request({"cmd": "load", "image": image_png, "preview": preview_png,
-                              "preview_width": preview_size[0], "preview_height": preview_size[1]},
-                             self.on_loaded)
+        load = {"cmd": "load", "image": image_png, "preview": preview_png,
+                "preview_width": preview_size[0], "preview_height": preview_size[1]}
+        if guide_raw:
+            load["guide"] = guide_raw  # GIMP's current selection, to start from
+        self.backend.request(load, self.on_loaded)
 
     # --- layout ---
 
@@ -434,6 +437,15 @@ class AISelectDialog(Gtk.Dialog):
             button.connect("clicked", handler)
             buttons.pack_start(button, True, True, 0)
         side.pack_start(buttons, False, False, 2)
+        self.guide_button = Gtk.Button(label="Find object in GIMP's selection")
+        self.guide_button.set_tooltip_text(
+            "Your selection in GIMP (shown as a thin cyan outline) is used as a rough guide: "
+            "the object inside each separate area of it is selected, starting over like a "
+            "click. A rough lasso is enough; if one area contains several objects, click the "
+            "one you mean instead.")
+        self.guide_button.connect("clicked", lambda b: self.use_guide())
+        self.guide_button.set_no_show_all(True)  # shown once the image is loaded
+        side.pack_start(self.guide_button, False, False, 2)
 
         heading("Selection")
         grid = Gtk.Grid(column_spacing=6, row_spacing=3)
@@ -694,6 +706,18 @@ class AISelectDialog(Gtk.Dialog):
             cr.get_source().set_filter(cairo.FILTER_GOOD if s < 1 else cairo.FILTER_BILINEAR)
             cr.paint()
             cr.restore()
+        if self.guide:  # GIMP's selection, for reference: thin cyan dashes
+            for rgb, width, dash in (((0, 0, 0), 2.5, []), ((0.2, 0.85, 1.0), 1.2, [6, 4])):
+                for poly in self.guide["polygons"]:
+                    cr.move_to(poly[0][0] * self.zoom, poly[0][1] * self.zoom)
+                    for x, y in poly[1:]:
+                        cr.line_to(x * self.zoom, y * self.zoom)
+                    cr.close_path()
+                cr.set_source_rgba(*rgb, 0.8)
+                cr.set_line_width(width)
+                cr.set_dash(dash)
+                cr.stroke()
+            cr.set_dash([])
         # Boxes and click markers: green = include, red = exclude.
         for obj in self.objects:
             if obj.get("box"):
@@ -833,6 +857,15 @@ class AISelectDialog(Gtk.Dialog):
         return True
 
     # --- clicks ---
+
+    def use_guide(self):
+        """Select the object inside each separate area of GIMP's selection (its bounding box
+        plus a click at the point deepest inside it), starting over, as one undo step."""
+        if self.guide and self.ready:
+            self.history.append(copy.deepcopy(self.objects))
+            self.objects = [{"sign": 1, "box": g["box"], "points": [g["point"] + [1]]}
+                            for g in self.guide["prompts"]]
+            self.render()
 
     def add_click(self, point, shift=False, ctrl=False):
         self.add_prompt({"points": [point + [1]]}, shift, ctrl)
@@ -1034,7 +1067,14 @@ class AISelectDialog(Gtk.Dialog):
         self.ready = True
         how = ("image analysis reused" if reply.get("cached")
                else f"analysed in {reply['seconds']} s")
-        self.set_status(f"Ready ({reply['device']}, {how}). Click an object to select it.")
+        hint = "Click an object to select it."
+        self.guide = reply.get("guide")
+        if self.guide:
+            self.guide_button.show()
+            hint = ("Click an object, or press \"Find object in GIMP's selection\" to start "
+                    "from your selection (cyan).")
+            self.area.queue_draw()
+        self.set_status(f"Ready ({reply['device']}, {how}). {hint}")
         return False
 
     def on_rendered(self, reply, version, soft=False):
@@ -1169,6 +1209,18 @@ def scaled_surface(surface, scale):
 # --- GIMP side ------------------------------------------------------------------------
 
 
+def export_selection(image, path):
+    """Write GIMP's selection as 8-bit values (image size), read in its own storage format
+    so the values aren't gamma-converted."""
+    selection = image.get_selection()
+    w, h = image.get_width(), image.get_height()
+    fmt = "Y' u8" if Babl.get_name(selection.get_format()).startswith("Y'") else "Y u8"
+    data = selection.get_buffer().get(Gegl.Rectangle.new(0, 0, w, h), 1.0, fmt,
+                                      Gegl.AbyssPolicy.NONE)
+    with open(path, "wb") as f:
+        f.write(bytes(data))
+
+
 def export_visible(image, path):
     dup = image.duplicate()
     dup.merge_visible_layers(Gimp.MergeType.CLIP_TO_IMAGE)
@@ -1276,9 +1328,13 @@ def ai_select_steps(procedure, run_mode, image, config):
 
         if run_mode == Gimp.RunMode.INTERACTIVE:
             GimpUi.init("aiselect")
+            guide_raw = None
+            if has_selection:  # offered as a starting point in the window
+                guide_raw = os.path.join(work, "gimp_selection.raw")
+                export_selection(image, guide_raw)
             dialog = AISelectDialog(backend, image_png, size, preview_png, psize, options,
                                     soft_available=soft_edges_available(settings),
-                                    has_selection=has_selection)
+                                    has_selection=has_selection, guide_raw=guide_raw)
             response = dialog.run()
             objects, options = dialog.objects, dialog.options
             dialog.destroy()

@@ -30,6 +30,12 @@ whole object, so to remove just a piece of an object with Ctrl+click, switch Gra
 to *Part* or *Detail* first. For a box, the box itself sets the size, so Granularity
 doesn't apply.
 
+If the image already has a selection in GIMP, for example a rough lasso drawn with Free
+Select, the window shows its outline in cyan and offers **Find object in GIMP's
+selection**: it selects the object inside each separate area of your selection (using the
+area's bounding box and the point deepest inside it), so a quick, loose lasso around each
+object is enough. If one area contains several objects, click the one you mean instead.
+
 Moving the mouse over the image outlines the object a click would select, using the
 current Granularity and Threshold, so you can see the result before you click; the
 **Show object under cursor** option switches this off. The selection itself is previewed
