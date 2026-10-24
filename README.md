@@ -113,7 +113,6 @@ installer and uninstaller stop a running backend before changing its files.
 - **Disk space:** about 6 GB (PyTorch and other packages 4.4 GB, SAM 2 checkpoint 0.9 GB,
   ViTMatte checkpoint and code 0.5 GB). About 0.5 GB less with `--no-soft-edges`.
 - **Internet access** during installation, to download the packages and checkpoints.
-- **No C++ or CUDA compiler** is needed.
 - **Operating system:** tested on Windows 11 only. The installer contains code for Linux
   and macOS, but **it has not been tested on Linux or macOS**.
 
