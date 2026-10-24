@@ -15,6 +15,7 @@ click in this window; when you press **Select**, the result becomes GIMP's selec
 
 | Action | Effect |
 |---|---|
+| Hover | Outline what a click would select (yellow; green with Shift, red with Ctrl) |
 | Click | Select the object under the cursor (starts over) |
 | Drag | Select the object inside the box you drag (starts over) |
 | Shift+click / Shift+drag | Add the object (or part) under the cursor / inside the box |
@@ -29,7 +30,10 @@ whole object, so to remove just a piece of an object with Ctrl+click, switch Gra
 to *Part* or *Detail* first. For a box, the box itself sets the size, so Granularity
 doesn't apply.
 
-The selection is previewed live as a tinted overlay with a dashed outline. The cursor looks
+Moving the mouse over the image outlines the object a click would select, using the
+current Granularity and Threshold, so you can see the result before you click; the
+**Show object under cursor** option switches this off. The selection itself is previewed
+live as a tinted overlay with a dashed outline. The cursor looks
 like GIMP's Fuzzy Select cursor and shows **+** while Shift is held and **−** while Ctrl
 is held.
 

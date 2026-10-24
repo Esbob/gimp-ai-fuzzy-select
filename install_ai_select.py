@@ -397,6 +397,8 @@ removed = final([{"sign": 1, "points": [[700, 80, 1]]}, {"sign": 1, "points": [[
                  {"sign": -1, "points": [[400, 250, 1]]}])
 res["ctrl_removes_spot"] = bool(removed[250, 400] < 0.5 and removed[80, 700] > 0.5)
 res["mae_box"] = float(np.abs(final([{"sign": 1, "box": [240, 140, 560, 460]}]) - true).mean())
+hover = call(cmd="hover", point=[400, 300], threshold=50, granularity="auto")
+res["hover_outline"] = len(hover["polygons"]) > 0 and int((hard > 0.5).sum()) == hover["area"]
 res["grow_bigger"] = bool((final(click, grow=5) > 0.5).sum() > (hard > 0.5).sum())
 f = final(click, feather=10)
 res["feather_soft_px"] = int(((f > 0.02) & (f < 0.98)).sum())
@@ -532,6 +534,7 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (r["shift_adds_spot"], "Shift+click adds the clicked object, keeping the first"),
         (r["ctrl_removes_spot"], "Ctrl+click subtracts the clicked object, keeping the rest"),
         (r["mae_box"] < 0.03, f"a box around the object selects it (error vs true alpha {r['mae_box']:.4f})"),
+        (r["hover_outline"], "hovering outlines exactly what a click there selects"),
         (r["grow_bigger"], "grow enlarges the selection"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
     ]

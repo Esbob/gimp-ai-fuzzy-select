@@ -6,6 +6,7 @@ An AI "fuzzy select": instead of growing a selection over similar colours, it se
 the object you click on, using SAM2. GIMP plugins can't receive clicks on the canvas, so
 the clicking happens in the plugin's own window, with a live preview:
 
+    hover           outline what a click would select
     click / drag    select the object under the cursor / inside the dragged box
     Shift+...       add the object (or part) under the cursor / inside the box
     Ctrl+...        subtract the object (or part) under the cursor / inside the box
@@ -53,7 +54,7 @@ SERVER = os.path.join(PLUGIN_DIR, "aiselect_server.py")
 PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 
 DEFAULT_OPTIONS = {
-    "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
+    "hover": True, "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
     "soft": False, "edge": 4, "operation": "replace",
 }
 RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "soft", "edge")
@@ -212,6 +213,10 @@ class AISelectDialog(Gtk.Dialog):
         self.soft_timer = None
         self.pan_start = None
         self.drag = None  # a left/right button press in progress: click or box
+        # Hover preview: the outline a click under the mouse would select.
+        self.hover_target = None  # image point under the mouse, or None
+        self.hover_polygons = None  # outline for the last hover reply
+        self.hover_busy = False  # a hover request is in flight
         self.cursors = {}
         self.modifiers = 0  # Shift/Ctrl currently held, for the cursor's +/- sign
 
@@ -276,13 +281,14 @@ class AISelectDialog(Gtk.Dialog):
         self.area = Gtk.DrawingArea()
         self.area.add_events(Gdk.EventMask.BUTTON_PRESS_MASK | Gdk.EventMask.BUTTON_RELEASE_MASK
                              | Gdk.EventMask.POINTER_MOTION_MASK | Gdk.EventMask.ENTER_NOTIFY_MASK
-                             | Gdk.EventMask.SCROLL_MASK)
+                             | Gdk.EventMask.LEAVE_NOTIFY_MASK | Gdk.EventMask.SCROLL_MASK)
         self.area.connect("draw", self.on_draw)
         self.area.connect("button-press-event", self.on_press)
         self.area.connect("button-release-event", self.on_release)
         self.area.connect("motion-notify-event", self.on_motion)
         self.area.connect("scroll-event", self.on_scroll)
         self.area.connect("enter-notify-event", lambda w, e: self.update_cursor(e.state))
+        self.area.connect("leave-notify-event", lambda w, e: self.clear_hover())
         self.area.connect("realize", lambda w: self.update_cursor())
         self.scroller = Gtk.ScrolledWindow()
         self.scroller.add(self.area)
@@ -329,6 +335,12 @@ class AISelectDialog(Gtk.Dialog):
         side.pack_start(help_label, False, False, 0)
 
         heading("Clicks")
+        self.hover = Gtk.CheckButton(label="Show object under cursor")
+        self.hover.set_active(self.options["hover"])
+        self.hover.set_tooltip_text("While you move the mouse, outline what a click would select "
+                                    "(yellow; green with Shift, red with Ctrl)")
+        self.hover.connect("toggled", self.on_hover_toggled)
+        side.pack_start(self.hover, False, False, 0)
         buttons = Gtk.Box(spacing=4)
         for text, handler in [("Undo", lambda b: self.undo()), ("Clear", lambda b: self.clear())]:
             button = Gtk.Button(label=text)
@@ -614,6 +626,25 @@ class AISelectDialog(Gtk.Dialog):
                 cr.arc(px, py, 4, 0, 6.2832)
                 cr.set_source_rgb(0.1, 0.75, 0.2) if include else cr.set_source_rgb(0.9, 0.15, 0.15)
                 cr.fill()
+        ctrl_with_nothing = self.modifiers & Gdk.ModifierType.CONTROL_MASK and not self.objects
+        if self.hover_polygons and not self.drag and self.pan_start is None and not ctrl_with_nothing:
+            # What a click would select: yellow, or green/red when Shift/Ctrl would add/remove.
+            # (Ctrl with nothing selected yet does nothing, so nothing is shown.)
+            if self.modifiers & Gdk.ModifierType.CONTROL_MASK:
+                colour = (0.95, 0.2, 0.2)
+            elif self.modifiers & Gdk.ModifierType.SHIFT_MASK:
+                colour = (0.3, 0.9, 0.3)
+            else:
+                colour = (1.0, 0.85, 0.1)
+            for rgb, width in (((0, 0, 0), 3.5), (colour, 1.8)):
+                for poly in self.hover_polygons:
+                    cr.move_to(poly[0][0] * self.zoom, poly[0][1] * self.zoom)
+                    for x, y in poly[1:]:
+                        cr.line_to(x * self.zoom, y * self.zoom)
+                    cr.close_path()
+                cr.set_source_rgb(*rgb)
+                cr.set_line_width(width)
+                cr.stroke()
         if self.drag and self.drag["dragging"]:  # the box being dragged, as marching ants
             (x1, y1), (x2, y2) = self.drag["start"], self.drag["end"]
             cr.rectangle(min(x1, x2) * self.zoom, min(y1, y2) * self.zoom,
@@ -664,6 +695,7 @@ class AISelectDialog(Gtk.Dialog):
         if not self.ready:
             self.set_status("Still analysing the image, one moment...")
             return True
+        self.clear_hover()
         # Decided on release: a press that doesn't move is a click, a drag is a box.
         self.drag = {
             "button": event.button, "widget": (event.x, event.y), "dragging": False,
@@ -686,6 +718,7 @@ class AISelectDialog(Gtk.Dialog):
             return True
         if self.pan_start is None:
             self.update_cursor(event.state)
+            self.hover_at(self.image_point(event.x, event.y))
             return False
         x0, y0, h0, v0 = self.pan_start
         self.scroller.get_hadjustment().set_value(h0 - (event.x_root - x0))
@@ -775,6 +808,8 @@ class AISelectDialog(Gtk.Dialog):
             else:
                 self.cursors[key] = make_tool_cursor(display, key)
         window.set_cursor(self.cursors[key])
+        if self.hover_polygons:
+            self.area.queue_draw()  # the hover outline's colour follows Shift/Ctrl
 
     def on_key_release(self, widget, event):
         if event.keyval in self.MODIFIER_KEYS:
@@ -817,6 +852,46 @@ class AISelectDialog(Gtk.Dialog):
         self.options[key] = value
         if self.objects:
             self.render()
+        if key in ("granularity", "threshold") and self.hover_target:
+            self.hover_polygons = None
+            self.hover_at(self.hover_target)
+
+    # --- hover preview ---
+
+    def hover_at(self, point):
+        """Ask for the outline a click at `point` would select. Only one request is in
+        flight; when it returns, the newest mouse position is requested next."""
+        self.hover_target = point
+        if point is None:
+            self.clear_hover()
+            return
+        if (not self.options["hover"] or not self.ready or self.busy or self.hover_busy
+                or self.drag or self.pan_start is not None):
+            return
+        self.hover_busy = True
+        self.backend.request({"cmd": "hover", "point": point, "threshold": self.options["threshold"],
+                              "granularity": self.options["granularity"]},
+                             self.on_hover, coalesce="hover")
+
+    def on_hover(self, reply):
+        self.hover_busy = False
+        if reply.get("ok") and self.hover_target is not None and self.options["hover"]:
+            self.hover_polygons = reply["polygons"]
+            self.area.queue_draw()
+        if self.hover_target is not None and self.hover_target != reply.get("point"):
+            self.hover_at(self.hover_target)  # the mouse moved on meanwhile
+        return False
+
+    def clear_hover(self):
+        self.hover_target = None
+        if self.hover_polygons:
+            self.hover_polygons = None
+            self.area.queue_draw()
+
+    def on_hover_toggled(self, button):
+        self.options["hover"] = button.get_active()
+        if not self.options["hover"]:
+            self.clear_hover()
 
     # --- backend ---
 

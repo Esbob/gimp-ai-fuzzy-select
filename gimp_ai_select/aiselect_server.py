@@ -17,6 +17,8 @@ Protocol: one JSON object per line on stdin, one JSON reply per line on stdout.
       (with "soft" and "soft_preview": ViTMatte edges computed at reduced size;
       "view": "mask" writes the selection as a white-on-black image instead).
       Final: write the full-size 8-bit selection to "out" (optionally with ViTMatte edges).
+  {"cmd": "hover", "point": [x, y], "threshold": 0-100, "granularity": ...}
+      the outline a click there would select: {"polygons": [[[x, y], ...], ...]}
   {"cmd": "quit"}
 Every reply has "id" (echoed from the request) and "ok", plus "error" on failure.
 """
@@ -117,21 +119,7 @@ class Server:
         labels = np.array([p[2] for p in points], dtype=np.int32)
         with torch.no_grad():
             if len(points) == 1:
-                masks, scores, low = self.predictor.predict(
-                    point_coords=coords, point_labels=labels, multimask_output=True,
-                    return_logits=True)
-                # Only candidates that contain the clicked pixel: SAM2's smallest candidate
-                # is sometimes a stray fragment elsewhere (31 px, score 0.09, next to a
-                # clicked disc), and picking it made Ctrl+click and "Detail" do nothing.
-                x, y = points[0][:2]
-                containing = [i for i in range(len(masks)) if masks[i][y, x] > 0] or list(range(len(masks)))
-                if granularity == "auto":
-                    pick = max(containing, key=lambda i: scores[i])
-                else:
-                    by_size = sorted(containing, key=lambda i: int((masks[i] > 0).sum()))
-                    pick = {"detail": by_size[0], "part": by_size[len(by_size) // 2],
-                            "whole": by_size[-1]}[granularity]
-                full, low = masks[pick], low[pick]
+                full, low = self.single_click(points[0][:2], granularity)
             else:
                 self.object_logits(points[:-1], granularity)
                 prev_low = self.cache[(granularity, tuple(map(tuple, points[:-1])))][1]
@@ -141,6 +129,46 @@ class Server:
                 full, low = masks[0], low[0]
         self.cache[key] = (full, low)
         return full
+
+    def single_click(self, point, granularity):
+        """Full-res and low-res logits for one click: SAM2's three candidates, picked by
+        Granularity. Only candidates that contain the clicked pixel count: SAM2's smallest
+        candidate is sometimes a stray fragment elsewhere (31 px, score 0.09, next to a
+        clicked disc), and picking it made Ctrl+click and "Detail" do nothing."""
+        x, y = point
+        with torch.no_grad():
+            masks, scores, low = self.predictor.predict(
+                point_coords=np.array([[x, y]], dtype=np.float32), point_labels=np.array([1]),
+                multimask_output=True, return_logits=True)
+        containing = [i for i in range(len(masks)) if masks[i][y, x] > 0] or list(range(len(masks)))
+        if granularity == "auto":
+            pick = max(containing, key=lambda i: scores[i])
+        else:
+            by_size = sorted(containing, key=lambda i: int((masks[i] > 0).sum()))
+            pick = {"detail": by_size[0], "part": by_size[len(by_size) // 2],
+                    "whole": by_size[-1]}[granularity]
+        return masks[pick], low[pick]
+
+    def cmd_hover(self, req):
+        """The outline a click at req["point"] would select, as polygons in image pixels.
+        Not cached (the mouse visits thousands of pixels; each full-res result is several
+        MB), and drawn by the window directly instead of via an image file."""
+        t0 = time.time()
+        cut = (50 - req.get("threshold", 50)) / 25.0
+        logits, _ = self.single_click(req["point"], req.get("granularity", "auto"))
+        mask = logits > cut
+        h, w = mask.shape
+        pw, ph = self.preview_size  # outline detail at preview resolution is plenty
+        small = cv2.resize(mask.astype(np.uint8), (pw, ph), interpolation=cv2.INTER_NEAREST)
+        contours, _ = cv2.findContours(small, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
+        sx, sy = w / pw, h / ph
+        polygons = []
+        for c in contours:
+            c = cv2.approxPolyDP(c, 0.8, True)[:, 0]
+            if len(c) >= 3:
+                polygons.append([[round(float(x) * sx, 1), round(float(y) * sy, 1)] for x, y in c])
+        return {"point": req["point"], "polygons": polygons, "area": int(mask.sum()),
+                "seconds": round(time.time() - t0, 3)}
 
     def box_logits(self, box):
         """Full-res mask logits for the object inside a dragged box [x1, y1, x2, y2]. SAM2
