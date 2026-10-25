@@ -1,0 +1,2 @@
+# Batch files need Windows line endings, also in downloaded zip files
+*.bat -text

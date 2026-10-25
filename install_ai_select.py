@@ -5,7 +5,7 @@ by object: click an object and SAM2 selects it; Shift+click adds, Ctrl+click rem
 result is a normal GIMP selection.
 
 What it does:
-  1. Creates a virtual environment with the Python running this script (3.10-3.13).
+  1. Creates a virtual environment with the Python running this script (3.10-3.14).
   2. Installs a PyTorch build matching your GPU (CPU-only if there is none).
   3. Installs SAM2 (pinned) and downloads a SAM 2.1 model: large with an NVIDIA GPU,
      small without one (--model chooses; give it twice for both).
@@ -58,6 +58,10 @@ MODELS = {
     "small": ("configs/sam2.1/sam2.1_hiera_s.yaml", "sam2.1_hiera_small.pt", 185),
 }
 MODEL_URL = "https://dl.fbaipublicfiles.com/segment_anything_2/092824/{}"
+# Pythons the installer and the backend's environment run on. 3.15: with PyTorch 2.14.1 the
+# backend crashes (an access violation freeing a tensor made from a NumPy array in another
+# thread, which Sharper outlines does); 3.13 and 3.14 with the same PyTorch and NumPy don't.
+SUPPORTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
 # Soft edges: ViTMatte's model code and config live in Matte Anything; its config system
 # is detectron2's LazyConfig.
 MATTE_ANYTHING = ("hustvl/Matte-Anything", "874951ac0b8d324ad9f885baf1c7de711b8dc1b0")
@@ -344,7 +348,7 @@ def create_venv(venv_dir):
         out = subprocess.run([str(py), "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
                              capture_output=True, text=True)
         version = out.stdout.strip()
-        if out.returncode or version not in ("3.10", "3.11", "3.12", "3.13"):
+        if out.returncode or version not in SUPPORTED_PYTHONS:
             sys.exit(f"The existing environment {venv_dir} doesn't work"
                      f"{f' (it uses Python {version})' if version else ''}: probably the Python it was "
                      f"made with was removed or upgraded. Delete the folder {venv_dir} and run the "
@@ -939,8 +943,13 @@ def main():
     parser.add_argument("--test-only", action="store_true", help="skip installing, just run the tests")
     args = parser.parse_args()
 
-    if not (3, 10) <= sys.version_info[:2] <= (3, 13):
-        sys.exit(f"Run this with Python 3.10-3.13 (this is {platform.python_version()}).")
+    if "%d.%d" % sys.version_info[:2] not in SUPPORTED_PYTHONS:
+        too_new = sys.version_info[:2] > (3, 14)
+        sys.exit(f"This is Python {platform.python_version()}; AI Fuzzy Select needs Python 3.10-3.14."
+                 + (" (On Python 3.15, PyTorch crashes the backend: tested with PyTorch 2.14.1.)"
+                    if too_new else "")
+                 + "\nInstall Python 3.14 from https://www.python.org/downloads/ and run this with it, "
+                   "e.g.  py -3.14 install_ai_select.py")
     if platform.architecture()[0] != "64bit":
         sys.exit("A 64-bit Python is required for PyTorch.")
 

@@ -107,7 +107,7 @@ installer and uninstaller stop a running backend before changing its files.
 
 - **GIMP 3** with Python plug-in support (included in the official Windows installer).
   Tested with GIMP 3.2.6.
-- **Python 3.10–3.13, 64-bit**, to run the installer. The plug-in's backend runs in a
+- **Python 3.10–3.14, 64-bit**, to run the installer (not 3.15: PyTorch crashes on it). The plug-in's backend runs in a
   virtual environment the installer creates with this Python; GIMP's own Python is not
   used for the models.
 - **An NVIDIA GPU is strongly recommended.** Tested on a GeForce GTX 1050 Ti (2018) with 4 GB of
@@ -124,16 +124,30 @@ installer and uninstaller stop a running backend before changing its files.
 
 ## Installation
 
-```
-python install_ai_select.py
-```
+On Windows:
 
-This creates a virtual environment in `%LOCALAPPDATA%\gimp-ai-select` (on Windows),
-installs PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the
-checkpoints, copies the plug-in into GIMP's `plug-ins` folder and runs a set of tests.
-Then restart GIMP and use **Select > AI Fuzzy Select...**.
+1. **Install GIMP 3** from [gimp.org](https://www.gimp.org/downloads/), start it once and close it.
+2. **Install Python 3.14** from [python.org](https://www.python.org/downloads/release/python-3149/)
+   (the Windows installer, 64-bit; the default settings are fine). Not Python 3.15: PyTorch
+   crashes on it.
+3. **Download [gimp-ai-fuzzy-select.zip](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip)**
+   and unzip it anywhere (right-click > Extract All).
+4. **Double-click `install.bat`** in the unzipped folder. If Windows asks whether to run it,
+   choose Run (or More info > Run anyway). It downloads about 4 GB, sets everything up and
+   ends with a set of tests.
+5. **Start GIMP** (restart it if it's open) and use **Select > AI Fuzzy Select...**
 
-Useful options:
+The installer creates a virtual environment in `%LOCALAPPDATA%\gimp-ai-select`, installs
+PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the checkpoints, copies
+the plug-in into GIMP's `plug-ins` folder and runs the tests. The unzipped folder isn't
+needed afterwards, except for uninstalling.
+
+With git, or on Linux and macOS (untested): `git clone https://github.com/Esbob/gimp-ai-fuzzy-select`
+(or download the zip) and run `python install_ai_select.py` in that folder (`python3` on
+Linux and macOS).
+
+Installer options go after `install.bat` in a Command Prompt, or after
+`python install_ai_select.py`:
 
 | Option | Use |
 |---|---|
@@ -150,15 +164,12 @@ downloads; the installer then explains how to download it by hand.
 
 ## Uninstalling
 
-```
-python uninstall_ai_select.py
-```
-
-This shows what it will remove and asks first: the plug-in from every GIMP 3 profile
+Double-click `uninstall.bat` (or run `python uninstall_ai_select.py`). It shows what it will
+remove and asks first: the plug-in from every GIMP 3 profile
 (including your remembered options), the install folder with its virtual environment,
 sources and downloaded checkpoints, and the plug-in's log file. Checkpoints you gave the
 installer with `--sam2-checkpoint` or `--vitmatte-checkpoint` are yours and are kept.
-Close GIMP first.
+Close GIMP first. Options go after `uninstall.bat` or `python uninstall_ai_select.py`:
 
 | Option | Use |
 |---|---|
