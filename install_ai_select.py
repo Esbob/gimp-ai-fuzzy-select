@@ -7,8 +7,9 @@ result is a normal GIMP selection.
 What it does:
   1. Creates a virtual environment with the Python running this script (3.10-3.14).
   2. Installs a PyTorch build matching your GPU (CPU-only if there is none).
-  3. Installs SAM2 (pinned) and downloads a SAM 2.1 model: large with an NVIDIA GPU,
-     small without one (--model chooses; give it twice for both).
+  3. Installs SAM2 (pinned) and downloads both SAM 2.1 models, large and small. It starts
+     with large on an NVIDIA GPU of 3 GB or more, otherwise small (--model chooses); if the
+     image can't be analysed with it, the backend falls back to small, then to the CPU.
   4. Optionally (default on) installs ViTMatte for the "Soft edges" option: detectron2
      and the ViTMatte code from Matte Anything are used as plain source, so no C++/CUDA
      compiler is needed.
@@ -19,7 +20,7 @@ What it does:
 Usage:
   python install_ai_select.py
   python install_ai_select.py --no-soft-edges          # lighter: SAM2 only
-  python install_ai_select.py --model large --model small   # both, switch in the window
+  python install_ai_select.py --model small   # start with SAM 2.1 small
   python install_ai_select.py --sam2-checkpoint sam2.1_hiera_large.pt   # reuse a download
   python install_ai_select.py --test-only
 
@@ -188,23 +189,23 @@ def default_install_dir():
 
 
 def detect_nvidia_gpu():
-    """Return (name, compute capability or None, driver version) or None. Older drivers'
-    nvidia-smi has no compute_cap field: then the capability is None, not "no GPU"."""
+    """Return (name, compute capability or None, driver version, memory in MiB or None) or
+    None. Older drivers' nvidia-smi has no compute_cap field: then the capability is None,
+    not "no GPU"."""
     exe = shutil.which("nvidia-smi")
     if not exe:
         return None
-    for fields in ("driver_version,compute_cap,name", "driver_version,name"):  # name last: may hold commas
-        try:
-            out = subprocess.run([exe, f"--query-gpu={fields}", "--format=csv,noheader"],
+    for fields in ("driver_version,memory.total,compute_cap,name", "driver_version,memory.total,name"):
+        try:  # (name last: it may hold commas)
+            out = subprocess.run([exe, f"--query-gpu={fields}", "--format=csv,noheader,nounits"],
                                  capture_output=True, text=True, timeout=30)
             if out.returncode:
                 continue
-            line = out.stdout.strip().splitlines()[0]
-            if fields.count(",") == 2:
-                driver, cap, name = line.split(",", 2)
-                return name.strip(), float(cap), driver.strip()
-            driver, name = line.split(",", 1)
-            return name.strip(), None, driver.strip()
+            parts = out.stdout.strip().splitlines()[0].split(",", fields.count(","))
+            driver, memory, name = parts[0].strip(), parts[1].strip(), parts[-1].strip()
+            memory = int(float(memory)) if memory.replace(".", "").isdigit() else None
+            cap = float(parts[2]) if len(parts) == 4 else None
+            return name, cap, driver, memory
         except Exception:
             continue
     return None
@@ -221,7 +222,7 @@ def choose_torch_index(gpu):
     """PyTorch wheels for this GPU. CUDA 13 builds need compute 7.5+ (they dropped
     Maxwell/Pascal/Volta) and driver r580+; CUDA 12.6 builds cover compute 5.0+ and need
     driver r528+ (Windows) / r525+ (Linux)."""
-    name, cap, driver = gpu
+    name, cap, driver, memory = gpu
     if cap is not None and cap >= 7.5 and driver_major(driver) >= 580:
         return "cu130"
     return "cu126"
@@ -586,6 +587,21 @@ if soft:
     s = final(click, soft=True)
     res["mae_soft"] = float(np.abs(s - true).mean())
     res["soft_s"] = round(time.time() - t0, 1)
+# Loading falls back when the GPU is too small: SAM 2.1 small on the GPU, then on the CPU
+# (a GPU of 1000 MB has no room for large, one of 150 MB for neither)
+def fallback(limit_mb):
+    p = subprocess.Popen([sys.executable, server, settings], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                         stderr=subprocess.DEVNULL, text=True, env=dict(os.environ, AISELECT_GPU_LIMIT_MB=str(limit_mb)))
+    p.stdin.write(json.dumps({"cmd": "load", "image": os.path.join(work, "input.png"), "model": "large",
+                              "preview": os.path.join(work, "p.png"), "preview_width": 400,
+                              "preview_height": 300}) + "\n")
+    p.stdin.flush()
+    r = json.loads(p.stdout.readline())
+    p.stdin.close(); p.wait(timeout=60)
+    return [r.get("model"), r.get("device"), bool(r.get("fallback"))]
+if res["device"] == "cuda" and "small" in json.loads(settings).get("models", {}):
+    res["fallback_small"] = fallback(1000)
+    res["fallback_cpu"] = fallback(150)
 res["models"] = {}
 for name in json.loads(settings).get("models", {}):
     t0 = time.time()
@@ -617,7 +633,10 @@ try:
         cfg.set_property("objects", json.dumps([{"sign": 1, "points": [[400, 300, 1]]}]))
         cfg.set_property("operation", operation)
         cfg.set_property("output", output)
-        return proc.run(cfg).index(0) == Gimp.PDBStatusType.SUCCESS
+        result = proc.run(cfg)
+        last_error[0] = None if result.index(0) == Gimp.PDBStatusType.SUCCESS else str(result.index(1))
+        return last_error[0] is None
+    last_error = [None]  # the plug-in's message when the last call failed
     def value(drawable, x, y):
         f = "Y' u8" if Babl.get_name(drawable.get_format()).startswith("Y'") else "Y u8"
         return bytes(drawable.get_buffer().get(Gegl.Rectangle.new(x, y, 1, 1), 1.0, f,
@@ -674,11 +693,13 @@ try:
     group = Gimp.GroupLayer.new(img, "group")
     img.insert_layer(group, None, 0)
     img.insert_layer(base.copy(), group, 0)
-    ai_select("replace", "cutout", [group])
+    made = ai_select("replace", "cutout", [group])
     gcut = img.get_layers()[0]
-    report["group_cutout"] = (not gcut.is_group() and gcut.get_mask() is None
-                              and bytes(gcut.get_buffer().get(Gegl.Rectangle.new(5, 5, 1, 1), 1.0, "R'G'B'A u8",
-                                                              Gegl.AbyssPolicy.NONE))[3] == 0)
+    group_checks = {"ran": made, "not a group": not gcut.is_group(), "no mask left": gcut.get_mask() is None,
+                    "outside cut away": bytes(gcut.get_buffer().get(Gegl.Rectangle.new(5, 5, 1, 1), 1.0,
+                                                                    "R'G'B'A u8", Gegl.AbyssPolicy.NONE))[3] == 0}
+    report["group_cutout"] = all(group_checks.values()) or str(
+        dict(group_checks, error=last_error[0], gimp=Gimp.version(), top_layer=gcut.get_name()))
     # A wrong option is refused before anything changes (no stray channel)
     channels = len(img.get_channels())
     report["bad_option"] = not ai_select("Add") and len(img.get_channels()) == channels
@@ -813,6 +834,10 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
          f"then shown: {r['sharp_refined_after'] == 1})"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
     ]
+    if "fallback_small" in r:
+        checks.append((r["fallback_small"] == ["small", "cuda", True] and r["fallback_cpu"] == ["small", "cpu", True],
+                       f"too little GPU memory falls back: with 1000 MB to {r['fallback_small'][:2]}, "
+                       f"with 150 MB to {r['fallback_cpu'][:2]}"))
     for name, (used, seconds, mae) in r.get("models", {}).items():
         checks.append((used == name and mae < 0.03,
                        f"model SAM 2.1 {name} loads and selects (error vs true alpha {mae:.4f}, "
@@ -933,8 +958,8 @@ def main():
     parser.add_argument("--no-soft-edges", action="store_true",
                         help="skip ViTMatte (the 'Soft edges' option); SAM2 only")
     parser.add_argument("--model", action="append", choices=list(MODELS),
-                        help="SAM 2.1 model to install; give it twice for both (switch in the window). "
-                             "Default: large with an NVIDIA GPU, small without one. The first is the default")
+                        help="SAM 2.1 model to start with (both are installed; switch in the window). "
+                             "Default: large with an NVIDIA GPU of 3 GB or more, otherwise small")
     parser.add_argument("--sam2-checkpoint", help="use this existing sam2.1_hiera_large.pt or sam2.1_hiera_small.pt "
                                                   "instead of downloading it")
     parser.add_argument("--vitmatte-checkpoint", help="use this existing ViTMatte_B_DIS.pth instead of downloading")
@@ -967,7 +992,13 @@ def main():
         index = "cpu"
     else:
         index = choose_torch_index(gpu)
-    models = list(dict.fromkeys(args.model or ["large" if index.startswith("cu") else "small"]))
+    # SAM 2.1 large needs about 1.5 GB of GPU memory, more with soft edges: on a 2 GB GPU it
+    # ran out (the desktop uses some too), small needs about 0.6 GB.
+    big_gpu = index.startswith("cu") and gpu is not None and (gpu[3] or 0) >= 3000
+    # Both models are installed: if the first can't analyse an image the backend falls back
+    # to small (see cmd_load in aiselect_server.py). The first is the one to start with.
+    first = (args.model or ["large" if big_gpu else "small"])[0]
+    models = [first] + [m for m in MODELS if m != first]
     if args.sam2_checkpoint and Path(args.sam2_checkpoint).name not in [MODELS[m][1] for m in models]:
         sys.exit(f"--sam2-checkpoint must be one of {', '.join(MODELS[m][1] for m in models)} "
                  "(the file name says which model it is)")
@@ -978,9 +1009,9 @@ def main():
 
     print("AI Fuzzy Select installer")
     info(f"Install dir : {install_dir}")
-    info(f"GPU         : {f'{gpu[0]} (compute {gpu[1] or "unknown"}, driver {gpu[2]})' if gpu else 'none detected'}")
+    info(f"GPU         : {f'{gpu[0]} ({gpu[3] or "?"} MiB, compute {gpu[1] or "unknown"}, driver {gpu[2]})' if gpu else 'none detected'}")
     info(f"PyTorch     : {index} wheels")
-    info(f"SAM2 models : SAM 2.1 {' and '.join(models)} (default {models[0]})")
+    info(f"SAM2 models : SAM 2.1 {' and '.join(models)} (starts with {models[0]})")
     info(f"Soft edges  : {'yes (ViTMatte)' if soft else 'no'}")
     info(f"GIMP plugin : {plugins_dir / 'aiselect'}")
     info(f"GIMP tests  : {gimp_console or 'skipped (gimp-console not found)'}")
@@ -1011,10 +1042,6 @@ def main():
             step("Fetching the SAM2 checkpoints")
             checkpoints = install_dir / "checkpoints"
             installed = {m: get_sam2_checkpoint(m, checkpoints, args.sam2_checkpoint) for m in models}
-            # Models downloaded by an earlier run stay available in the window
-            for m, (_, file, _) in MODELS.items():
-                if m not in installed and (checkpoints / file).exists():
-                    installed[m] = checkpoints / file
             settings = {"pythonPath": str(py), "model": models[0],
                         "models": {m: {"config": MODELS[m][0], "checkpoint": str(path)}
                                    for m, path in installed.items()}}

@@ -1236,13 +1236,48 @@ class AISelectDialog(Gtk.Dialog):
             self.render()
         return False
 
+    def tell(self, title, text, kind=Gtk.MessageType.INFO):
+        """A message box over the window, waiting for OK (the tests replace this)."""
+        box = Gtk.MessageDialog(transient_for=self, modal=True, message_type=kind,
+                                buttons=Gtk.ButtonsType.OK, text=title)
+        box.format_secondary_text(text)
+        box.run()
+        box.destroy()
+
+    def note_fallback(self, reply):
+        """The backend used another model or device than asked for (see cmd_load in
+        aiselect_server.py): show it in the Model dropdown, and say so. Returns a note for the
+        status line."""
+        used = reply["model"]
+        self.options["model"] = used  # (and remembered: the next run starts with it)
+        if getattr(self, "model", None) is not None and self.model.get_active_id() != used:
+            self.model.set_active_id(used)  # change_model sees no change: nothing reloads
+        label = lambda name: MODEL_LABELS.get(name, (name,))[0]
+        if not reply.get("gpu", True):  # no graphics card in use at all: the computer's memory
+            return f"{label(reply.get('wanted'))} needs more memory than this computer has: using {label(used)}. "
+        if reply["device"] != "cpu":
+            return f"{label(reply.get('wanted'))} doesn't fit in the graphics card's memory: using {label(used)}. "
+        if reply.get("fallback_now"):
+            tried = " or ".join(dict.fromkeys([label(reply.get("wanted")), label("small")]))
+            self.tell("Using the processor instead of the graphics card",
+                      f"The graphics card couldn't analyse the image with {tried}, most likely because "
+                      f"it doesn't have enough memory. AI Fuzzy Select now uses the processor (CPU) "
+                      f"with {label(used)}: it works the same, but analysing an image takes longer.")
+        return "Using the processor: the graphics card couldn't analyse the image. "
+
     def on_loaded(self, reply):
         if not reply["ok"]:
+            if reply.get("fatal"):  # no model works on this computer (see cmd_load)
+                self.set_busy(None)
+                self.tell("This image can't be analysed", reply["error"], Gtk.MessageType.ERROR)
+                self.response(Gtk.ResponseType.CANCEL)
+                return False
             self.set_busy("Could not analyse the image:\n\n" + reply["error"], error=True)
             self.set_status("Error: " + reply["error"])
             return False
         self.set_busy(None)
         self.ready = True
+        note = self.note_fallback(reply) if reply.get("fallback") else ""
         model = MODEL_LABELS.get(reply.get("model"), (reply.get("model"),))[0]
         how = (f"{model}, image analysis reused" if reply.get("cached")
                else f"{model}, analysed in {reply['seconds']} s")
@@ -1253,7 +1288,7 @@ class AISelectDialog(Gtk.Dialog):
             hint = ("Click an object, or press \"Find object in GIMP's selection\" to start "
                     "from your selection (cyan).")
             self.area.queue_draw()
-        self.set_status(f"Ready ({reply['device']}, {how}). {hint}")
+        self.set_status(f"Ready ({reply['device']}, {how}). {note}{hint}")
         return False
 
     def on_rendered(self, reply, version, soft=False):

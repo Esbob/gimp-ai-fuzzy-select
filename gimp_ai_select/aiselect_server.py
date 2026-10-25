@@ -15,7 +15,11 @@ starts with {"cmd": "hello", "token": ...}.
   {"cmd": "load", "image": png, "preview": png, "preview_width": w, "preview_height": h,
    "guide": raw, "model": name}
       encode the image with SAM2 model "model" (one of the settings' "models"; default:
-      the settings' "model"); the reply's "model" says which was used. (With "width" and
+      the settings' "model"). If that fails (a GPU without enough memory, say) it tries
+      SAM 2.1 small on the GPU, then small on the CPU; the reply's "model" and "device" say
+      which was used, and "fallback" is set if it wasn't the one asked for ("fallback_now"
+      if it failed this time, not only before). If nothing works the error has
+      "fatal": true and a message for the user. (With "width" and
       "height", "image" is raw 8-bit RGBA instead, and
       "transparent_black" blacks out the hidden colour of fully transparent pixels, as
       GIMP's PNG export does for RGB images); "preview" is where render writes its
@@ -52,10 +56,12 @@ import hmac
 import json
 import os
 import socket
+import subprocess
 import sys
 import threading
 import time
 import traceback
+from unittest import mock
 
 # Keep stdout for the protocol only; anything libraries print goes to stderr.
 PROTOCOL = sys.stdout
@@ -76,6 +82,10 @@ import torch  # noqa: E402
 TINT = (64, 160, 255)  # overlay colour (RGB)
 
 
+class LoadFailed(Exception):
+    """An image couldn't be analysed with any model on any device; the message is for the user."""
+
+
 def fill_holes(mask, max_area):
     """Fill enclosed holes (not touching the image border) of at most max_area pixels."""
     h, w = mask.shape
@@ -91,6 +101,12 @@ class Server:
     def __init__(self, settings):
         self.settings = settings
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.gpu = self.device  # what loading an image tries first (see load_plan)
+        self.failed = set()  # (model, device) that failed to load an image; not tried again
+        limit = os.environ.get("AISELECT_GPU_LIMIT_MB")  # tests: act like a smaller GPU
+        if limit and self.device == "cuda":
+            total = torch.cuda.get_device_properties(0).total_memory
+            torch.cuda.set_per_process_memory_fraction(min(1.0, float(limit) * 2 ** 20 / total))
         self.predictor = None
         self.model_name = None  # the SAM2 model loaded (see model_spec)
         self.vitmatte = None
@@ -132,6 +148,42 @@ class Server:
             name = self.settings.get("model") if self.settings.get("model") in models else next(iter(models))
         return name, models[name]["config"], models[name]["checkpoint"]
 
+    def load_plan(self, wanted):
+        """(model, device) pairs to try for an image, best first: the wanted model on the GPU,
+        SAM 2.1 small on the GPU, small on the CPU. Pairs that failed before are skipped
+        (unless nothing else is left), so a second image doesn't fail through them again."""
+        small = "small" if "small" in (self.settings.get("models") or {}) else wanted
+        plan = list(dict.fromkeys([(wanted, self.gpu), (small, self.gpu), (small, "cpu")]))
+        return [p for p in plan if p not in self.failed] or plan[-1:]
+
+    def analyse(self, name, device, key):
+        """Have model `name` on `device` analyse self.image (or reuse its analysis). Returns
+        whether the analysis was reused."""
+        if self.predictor is None or (name, device) != (self.model_name, self.device):
+            if device != self.device:
+                self.vitmatte = None  # loaded again on the new device when needed
+            self.device = device
+            self.load_sam2(name)
+        key += name + device
+        cached = key in self.analysed
+        if cached:
+            self.analysed.move_to_end(key)
+            pred = self.predictor
+            pred._features, pred._orig_hw, pred._is_batch = self.analysed[key]
+            pred._is_image_set = True
+        else:
+            with torch.no_grad(), self.encoder_lock:
+                self.predictor.set_image(self.image)
+                if self.device == "cuda":
+                    # The GPU works asynchronously: "ready" must mean ready (and the lock held
+                    # until it is). Only this stream: other work needn't finish.
+                    torch.cuda.current_stream().synchronize()
+            pred = self.predictor
+            self.analysed[key] = (pred._features, pred._orig_hw, pred._is_batch)
+            while len(self.analysed) > IMAGE_CACHE_SIZE:
+                self.analysed.popitem(last=False)
+        return cached
+
     def load_sam2(self, name=None):
         """Load a SAM2 model in place of the current one (only one is kept in memory)."""
         from sam2.build_sam import build_sam2
@@ -141,7 +193,13 @@ class Server:
         self.predictor = self.crop_predictor = None  # free the old one first
         if self.device == "cuda":
             torch.cuda.empty_cache()
-        model = build_sam2(config, checkpoint, device=self.device)
+        # Building a model for the CPU, SAM2 still uses the GPU if there is one (it warms up its
+        # positional encodings there, and moves a RoPE table there): hide it, or the CPU can't
+        # take over from a GPU that is out of memory.
+        hide_gpu = (mock.patch.object(torch.cuda, "is_available", lambda: False)
+                    if self.device == "cpu" else contextlib.nullcontext())
+        with hide_gpu:
+            model = build_sam2(config, checkpoint, device=self.device)
         self.predictor = SAM2ImagePredictor(model)
         self.crop_predictor = SAM2ImagePredictor(model)
         self.model_name = name
@@ -170,9 +228,7 @@ class Server:
 
     def cmd_load(self, req):
         t0 = time.time()
-        name = self.model_spec(req.get("model"))[0]
-        if self.predictor is None or name != self.model_name:
-            self.load_sam2(name)
+        wanted = self.model_spec(req.get("model"))[0]
         if req.get("width"):  # raw 8-bit RGBA from the plugin
             rgba = np.fromfile(req["image"], np.uint8).reshape(req["height"], req["width"], 4)
             self.image = rgba[..., :3].copy()
@@ -191,27 +247,34 @@ class Server:
             self.sharp_jobs.clear()
             self.sharp_done.clear()
             self.sharp_merged.clear()
-        key = hashlib.sha1(self.image.tobytes()).hexdigest() + str(self.image.shape) + self.model_name
-        cached = key in self.analysed
-        if cached:
-            self.analysed.move_to_end(key)
-            pred = self.predictor
-            pred._features, pred._orig_hw, pred._is_batch = self.analysed[key]
-            pred._is_image_set = True
+        key = hashlib.sha1(self.image.tobytes()).hexdigest() + str(self.image.shape)
+        failures = []
+        for name, device in self.load_plan(wanted):
+            try:
+                cached = self.analyse(name, device, key)
+                break
+            except Exception as e:
+                traceback.print_exc()
+                text = f"{type(e).__name__}: {e}"  # (SAM2 wraps an out-of-memory error in its own)
+                memory = any(m in text.lower() for m in ("out of memory", "not enough memory"))
+                failures.append((name, device, text.splitlines()[0][:200], memory))
+                self.failed.add((name, device))
+                self.predictor = self.crop_predictor = None
+                self.model_name = None
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
         else:
-            with torch.no_grad(), self.encoder_lock:
-                self.predictor.set_image(self.image)
-                if self.device == "cuda":
-                    # The GPU works asynchronously: "ready" must mean ready (and the lock held
-                    # until it is). Only this stream: other work needn't finish.
-                    torch.cuda.current_stream().synchronize()
-            pred = self.predictor
-            self.analysed[key] = (pred._features, pred._orig_hw, pred._is_batch)
-            while len(self.analysed) > IMAGE_CACHE_SIZE:
-                self.analysed.popitem(last=False)
+            print("could not analyse the image:", failures, flush=True)
+            memory = failures and all(f[3] for f in failures)
+            raise LoadFailed(
+                "AI Fuzzy Select couldn't analyse this image on this computer, neither on the "
+                "graphics card nor on the processor" + (": there isn't enough memory." if memory else ".")
+                + "\n\nClosing other programs and trying again may help.")
         h, w = self.image.shape[:2]
         reply = {"width": w, "height": h, "seconds": round(time.time() - t0, 2),
                  "device": self.device, "cached": cached, "model": self.model_name}
+        if (self.model_name, self.device) != (wanted, self.gpu):
+            reply.update(fallback=True, wanted=wanted, fallback_now=bool(failures), gpu=self.gpu == "cuda")
         if req.get("guide"):
             reply["guide"] = self.guide_prompt(req["guide"])
         return reply
@@ -372,12 +435,12 @@ class Server:
                 self.sharp_busy = (key, generation)
             refined = None  # on any failure: keep the normal outline
             try:
-                with torch.cuda.stream(stream) if stream else contextlib.nullcontext():
+                with torch.cuda.stream(stream) if stream and self.device == "cuda" else contextlib.nullcontext():
                     refined = self.refine_in_crop(obj, coarse, image)
             except BaseException:
                 traceback.print_exc()
             finally:
-                if stream is not None:
+                if stream is not None and self.device == "cuda":
                     stream.synchronize()
                     torch.cuda.empty_cache()  # give this stream's memory pool back
                 with self.sharp_lock:
@@ -629,9 +692,15 @@ def serve(server, lines, out):
             if req["cmd"] not in ("quit", "bye"):
                 reply.update(getattr(server, "cmd_" + req["cmd"])(req))
             reply["ok"] = True
+        except LoadFailed as e:  # already explained for the user
+            reply.update({"ok": False, "error": str(e), "fatal": True})
         except Exception as e:
             traceback.print_exc()
-            reply.update({"ok": False, "error": f"{type(e).__name__}: {e}"})
+            error = f"{type(e).__name__}: {e}"
+            if "out of memory" in error.lower() and server.device == "cuda":
+                torch.cuda.empty_cache()  # so that trying again can work
+                error = gpu_memory_message(error)
+            reply.update({"ok": False, "error": error})
         out.write(json.dumps(reply) + "\n")
         out.flush()
         if req["cmd"] == "quit":
@@ -639,6 +708,34 @@ def serve(server, lines, out):
         if req["cmd"] == "bye":
             return False
     return False
+
+
+def gpu_memory_message(error):
+    """A CUDA out-of-memory error explained: the GPU's memory and who uses it (nvidia-smi).
+    On a 2 GB GPU, a second backend left from an earlier run (1.6 GB with SAM 2.1 large)
+    made a new one fail while loading the model."""
+    lines = ["The GPU ran out of memory."]
+    try:
+        def query(what, fields):
+            return subprocess.run(["nvidia-smi", f"--query-{what}={fields}", "--format=csv,noheader"],
+                                  capture_output=True, text=True, timeout=10).stdout.strip().splitlines()
+        total, used = (x.strip() for x in query("gpu", "memory.total,memory.used")[0].split(","))
+        lines[0] = f"The GPU ran out of memory ({used} of {total} in use)."
+        apps = [[x.strip() for x in a.split(",")] for a in query("compute-apps", "pid,process_name,used_memory")]
+        # (Windows lists every program that draws on screen, without its memory: keep those
+        # whose memory is known, and Python processes, which may be backends)
+        apps = [a for a in apps if any(c.isdigit() for c in a[2]) or "python" in a[1].lower()]
+        if apps:
+            lines.append("Using it: " + "; ".join(
+                f"process {pid} ({os.path.basename(name)}, {mem})" + (" - this backend" if pid == str(os.getpid()) else "")
+                for pid, name, mem in apps) + ".")
+    except Exception:
+        pass
+    lines += ["Another AI Fuzzy Select backend left from an earlier run may be holding it: it stops by "
+              "itself after 10 minutes without use, or restart the computer.",
+              "On a GPU with less than 3 GB, use SAM 2.1 small: run the installer again with --model small.",
+              "", "(" + error.splitlines()[0][:300] + ")"]
+    return "\n".join(lines)
 
 
 def process_start(pid):

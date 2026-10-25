@@ -69,7 +69,7 @@ is held.
 
 | Option | What it does |
 |---|---|
-| Model | Shown when both models are installed: SAM 2.1 large (best quality) or SAM 2.1 small (about 3× faster, half the GPU memory). Switching analyses the image again; your clicks are kept |
+| Model | SAM 2.1 large (best quality) or SAM 2.1 small (about 3× faster, half the GPU memory). Switching analyses the image again; your clicks are kept. If the graphics card doesn't have enough memory, AI Fuzzy Select switches to small, and then to the processor (CPU), by itself |
 | Granularity | Auto, Whole object, Part or Detail: whether each click selects, adds or subtracts a whole object or a part of it (e.g. tree → crown → branch) |
 | Threshold | Like Fuzzy Select's threshold: higher selects more, lower selects less (50 = SAM 2's own cut-off) |
 | Fill holes | Fill holes in the selection up to this diameter in pixels, e.g. a window in a wall you want selected as solid. Only holes completely surrounded by the selection are filled, and SAM 2 already includes holes smaller than about 10 px. 0 (default) = off, keeps every hole (e.g. sky between branches) |
@@ -132,9 +132,8 @@ installer and uninstaller stop a running backend before changing its files.
   get PyTorch's CUDA 12.6 build and newer ones the CUDA 13 build, so the NVIDIA driver must
   support that CUDA version. Without an NVIDIA GPU everything runs on the CPU; this is
   untested and analysing the image will be much slower.
-- **Disk space:** about 6 GB (PyTorch and other packages 4.4 GB, SAM 2.1 large 0.9 GB,
-  ViTMatte checkpoint and code 0.5 GB). SAM 2.1 small is 0.2 GB; about 0.5 GB less with
-  `--no-soft-edges`.
+- **Disk space:** about 6 GB (PyTorch and other packages 4.4 GB, SAM 2.1 large and small
+  1.1 GB, ViTMatte checkpoint and code 0.5 GB); about 0.5 GB less with `--no-soft-edges`.
 - **Internet access** during installation, to download the packages and checkpoints.
 - **Operating system:** tested on Windows 11 (GIMP 3.2.6) and Ubuntu 26.04 (GIMP 3 from
   apt), both with an NVIDIA GPU. The installer contains code for macOS, but **it has not
@@ -175,7 +174,7 @@ after `python install_ai_select.py`:
 
 | Option | Use |
 |---|---|
-| `--model large` / `--model small` | Which SAM 2.1 model to install; give it twice for both and switch in the window (the first is the default). Without it: large with an NVIDIA GPU, small without one |
+| `--model large` / `--model small` | Which SAM 2.1 model to start with (both are installed; switch in the window). Without it: large with an NVIDIA GPU of 3 GB or more, otherwise small |
 | `--no-soft-edges` | Install SAM 2 only (no ViTMatte); the Soft edges option is greyed out |
 | `--sam2-checkpoint PATH` | Use an already downloaded `sam2.1_hiera_large.pt` or `sam2.1_hiera_small.pt` |
 | `--vitmatte-checkpoint PATH` | Use an already downloaded `ViTMatte_B_DIS.pth` |
