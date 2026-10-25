@@ -6,8 +6,8 @@ selects by *object* instead of by *colour*: click on something in the image and
 out which pixels belong to it. The result is a normal GIMP selection with marching ants.
 
 <p align="center">
-  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download-button.png" width="300" alt="Download for Windows"></a><br>
-  <sub>For GIMP 3 on Windows: unzip it and double-click <code>install.bat</code> · <a href="#installation">installation steps</a>, also for Linux and macOS (untested)</sub>
+  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download.png" width="220" alt="Download"></a><br>
+  <sub>For GIMP 3 on Windows and Linux: unzip it, then double-click <code>install.bat</code> (Windows) or run <code>sh install.sh</code> (Linux) · <a href="#installation">installation steps</a> · macOS untested</sub>
 </p>
 
 <img width="1920" height="1020" alt="AI_Fuzzy_Select" src="https://github.com/user-attachments/assets/2b375a6d-3563-4bd6-a517-694790976008" />
@@ -136,8 +136,9 @@ installer and uninstaller stop a running backend before changing its files.
   ViTMatte checkpoint and code 0.5 GB). SAM 2.1 small is 0.2 GB; about 0.5 GB less with
   `--no-soft-edges`.
 - **Internet access** during installation, to download the packages and checkpoints.
-- **Operating system:** tested on Windows 11 only. The installer contains code for Linux
-  and macOS, but **it has not been tested on Linux or macOS**.
+- **Operating system:** tested on Windows 11 (GIMP 3.2.6) and Ubuntu 26.04 (GIMP 3 from
+  apt), both with an NVIDIA GPU. The installer contains code for macOS, but **it has not
+  been tested on macOS**.
 
 <sub>[↑ Back to contents](#contents)</sub>
 
@@ -161,10 +162,10 @@ PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the checkpo
 the plug-in into GIMP's `plug-ins` folder and runs the tests. The unzipped folder isn't
 needed afterwards, except for uninstalling.
 
-On Linux and macOS (untested): download and unzip the same zip, then run `sh install.sh` in
+On Linux and macOS (macOS untested): download and unzip the same zip, then run `sh install.sh` in
 that folder in a terminal; on macOS you can instead double-click `install.command` (the first
-time, right-click it and choose Open). On Debian and Ubuntu, install Python's venv package
-first (e.g. `sudo apt install python3.12-venv`).
+time, right-click it and choose Open). On Ubuntu and Debian, install GIMP and Python's venv
+package from apt first: `sudo apt install gimp python3-venv` (tested on Ubuntu 26.04).
 
 With git: `git clone https://github.com/Esbob/gimp-ai-fuzzy-select`, then the same as above
 in that folder, or run `python install_ai_select.py` directly.
