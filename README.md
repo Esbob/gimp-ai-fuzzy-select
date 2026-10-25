@@ -9,7 +9,19 @@ out which pixels belong to it. The result is a normal GIMP selection with marchi
 
 https://github.com/user-attachments/assets/8a79728e-e93e-48f2-904d-6e7b5a6111e4
 
-**Contents:** [What it does](#what-the-plug-in-does) · [Requirements](#requirements) · [Installation](#installation) · [Uninstalling](#uninstalling) · [Credits](#credits-and-licences)
+**[Download the latest version](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip)**: unzip it and double-click `install.bat` (see [Installation](#installation)).
+
+## Contents
+
+- [What the plug-in does](#what-the-plug-in-does)
+  - [Clicking and dragging](#clicking-and-dragging)
+  - [Options](#options)
+  - [Viewing](#viewing)
+  - [How it works](#how-it-works)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [Uninstalling](#uninstalling)
+- [Credits and licences](#credits-and-licences)
 
 ## What the plug-in does
 
@@ -103,6 +115,8 @@ It shuts itself down after 10 minutes without use, which frees the video memory 
 `aiselect_settings.json` in the plug-in's folder (0 = stop when the window closes). The
 installer and uninstaller stop a running backend before changing its files.
 
+<sub>[↑ Back to contents](#contents)</sub>
+
 ## Requirements
 
 - **GIMP 3** with Python plug-in support (included in the official Windows installer).
@@ -121,6 +135,8 @@ installer and uninstaller stop a running backend before changing its files.
 - **Internet access** during installation, to download the packages and checkpoints.
 - **Operating system:** tested on Windows 11 only. The installer contains code for Linux
   and macOS, but **it has not been tested on Linux or macOS**.
+
+<sub>[↑ Back to contents](#contents)</sub>
 
 ## Installation
 
@@ -162,6 +178,8 @@ Installer options go after `install.bat` in a Command Prompt, or after
 The ViTMatte checkpoint is downloaded from Google Drive, which sometimes refuses
 downloads; the installer then explains how to download it by hand.
 
+<sub>[↑ Back to contents](#contents)</sub>
+
 ## Uninstalling
 
 Double-click `uninstall.bat` (or run `python uninstall_ai_select.py`). It shows what it will
@@ -179,6 +197,8 @@ Close GIMP first. Options go after `uninstall.bat` or `python uninstall_ai_selec
 | `--install-dir PATH` | The install folder, if it isn't found from the plug-in's settings |
 | `--gimp-plugins-dir PATH` | Only remove the plug-in from this plug-ins folder |
 
+<sub>[↑ Back to contents](#contents)</sub>
+
 ## Credits and licences
 
 Co-authored with [Claude Code](https://claude.com/claude-code) (Claude Opus 5.5, by Anthropic).
@@ -189,3 +209,5 @@ versions:
 - [SAM 2](https://github.com/facebookresearch/sam2) and its SAM 2.1 checkpoints, by Meta (Apache 2.0)
 - ViTMatte code and checkpoint from [Matte Anything](https://github.com/hustvl/Matte-Anything) (MIT), for soft edges
 - [detectron2](https://github.com/facebookresearch/detectron2) by Meta (Apache 2.0), for loading ViTMatte
+
+<sub>[↑ Back to contents](#contents)</sub>
