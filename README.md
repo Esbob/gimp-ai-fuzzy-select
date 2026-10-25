@@ -9,7 +9,8 @@ out which pixels belong to it. The result is a normal GIMP selection with marchi
 
 https://github.com/user-attachments/assets/8a79728e-e93e-48f2-904d-6e7b5a6111e4
 
-**[Download the latest version](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip)**: unzip it and double-click `install.bat` (see [Installation](#installation)).
+> [!TIP]
+> **[Download the latest version](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip)**, unzip it and double-click `install.bat` (see [Installation](#installation)).
 
 ## Contents
 
