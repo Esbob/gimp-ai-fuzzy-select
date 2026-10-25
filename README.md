@@ -6,6 +6,7 @@ selects by *object* instead of by *colour*: click on something in the image and
 out which pixels belong to it. The result is a normal GIMP selection with marching ants.
 
 <img width="1920" height="1020" alt="AI_Fuzzy_Select" src="https://github.com/user-attachments/assets/2b375a6d-3563-4bd6-a517-694790976008" />
+
 https://github.com/user-attachments/assets/8a79728e-e93e-48f2-904d-6e7b5a6111e4
 
 **Contents:** [What it does](#what-the-plug-in-does) · [Requirements](#requirements) · [Installation](#installation) · [Uninstalling](#uninstalling) · [Credits](#credits-and-licences)
