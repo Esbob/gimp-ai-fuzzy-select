@@ -161,12 +161,16 @@ PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the checkpo
 the plug-in into GIMP's `plug-ins` folder and runs the tests. The unzipped folder isn't
 needed afterwards, except for uninstalling.
 
-With git, or on Linux and macOS (untested): `git clone https://github.com/Esbob/gimp-ai-fuzzy-select`
-(or download the zip) and run `python install_ai_select.py` in that folder (`python3` on
-Linux and macOS).
+On Linux and macOS (untested): download and unzip the same zip, then run `sh install.sh` in
+that folder in a terminal; on macOS you can instead double-click `install.command` (the first
+time, right-click it and choose Open). On Debian and Ubuntu, install Python's venv package
+first (e.g. `sudo apt install python3.12-venv`).
 
-Installer options go after `install.bat` in a Command Prompt, or after
-`python install_ai_select.py`:
+With git: `git clone https://github.com/Esbob/gimp-ai-fuzzy-select`, then the same as above
+in that folder, or run `python install_ai_select.py` directly.
+
+Installer options go after `install.bat` in a Command Prompt, after `sh install.sh`, or
+after `python install_ai_select.py`:
 
 | Option | Use |
 |---|---|
@@ -185,12 +189,14 @@ downloads; the installer then explains how to download it by hand.
 
 ## Uninstalling
 
-Double-click `uninstall.bat` (or run `python uninstall_ai_select.py`). It shows what it will
+Double-click `uninstall.bat` (Linux and macOS: `sh uninstall.sh`, or double-click
+`uninstall.command` on macOS; or run `python uninstall_ai_select.py`). It shows what it will
 remove and asks first: the plug-in from every GIMP 3 profile
 (including your remembered options), the install folder with its virtual environment,
 sources and downloaded checkpoints, and the plug-in's log file. Checkpoints you gave the
 installer with `--sam2-checkpoint` or `--vitmatte-checkpoint` are yours and are kept.
-Close GIMP first. Options go after `uninstall.bat` or `python uninstall_ai_select.py`:
+Close GIMP first. Options go after `uninstall.bat`, `sh uninstall.sh` or
+`python uninstall_ai_select.py`:
 
 | Option | Use |
 |---|---|
