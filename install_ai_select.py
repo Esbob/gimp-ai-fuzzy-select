@@ -28,6 +28,7 @@ Only the Python standard library is needed to run this script.
 """
 
 import argparse
+import contextlib
 import json
 import locale
 import os
@@ -127,6 +128,31 @@ def run(cmd, env=None, cwd=None, capture=False):
             print(result.stdout)
         raise InstallError(f"Command failed (exit {result.returncode}): {printable[:300]}")
     return result.stdout if capture else ""
+
+
+@contextlib.contextmanager
+def temp_on_disk(install_dir):
+    """Temporary files of the install steps go to a folder in the install dir, deleted
+    afterwards. pip unpacks the PyTorch packages (several GB on Linux) in the temporary folder,
+    and on some systems that is in memory and too small: on Ubuntu 26.04 /tmp is a tmpfs and
+    the install failed with a quota error. (Only for the install steps: the plug-in and its
+    backend keep their state and log files in the normal temporary folder.)"""
+    tmp = Path(install_dir) / "tmp"
+    tmp.mkdir(parents=True, exist_ok=True)
+    names = ("TMPDIR", "TEMP", "TMP")  # Linux and macOS; Windows
+    saved, saved_tempdir = {n: os.environ.get(n) for n in names}, tempfile.tempdir
+    os.environ.update({n: str(tmp) for n in names})
+    tempfile.tempdir = str(tmp)
+    try:
+        yield
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+        tempfile.tempdir = saved_tempdir
+        shutil.rmtree(tmp, ignore_errors=True)
 
 
 def download(url, dest):
@@ -1035,24 +1061,25 @@ def main():
         else:
             if stop_backend():
                 info("Stopped the running AI Fuzzy Select backend (it is restarted on next use)")
-            step("Creating virtual environment")
-            py = create_venv(install_dir / "venv")
-            step(f"Installing PyTorch ({index}) and SAM2")
-            install_sam2(py, index, src)
-            step("Fetching the SAM2 checkpoints")
-            checkpoints = install_dir / "checkpoints"
-            installed = {m: get_sam2_checkpoint(m, checkpoints, args.sam2_checkpoint) for m in models}
-            settings = {"pythonPath": str(py), "model": models[0],
-                        "models": {m: {"config": MODELS[m][0], "checkpoint": str(path)}
-                                   for m, path in installed.items()}}
-            if soft:
-                step("Installing ViTMatte for soft edges")
-                vitmatte_dir = install_soft_edges(py, src)
-                vitmatte_ckpt = get_vitmatte_checkpoint(
-                    py, install_dir / "checkpoints" / "ViTMatte_B_DIS.pth", args.vitmatte_checkpoint)
-                settings.update({"vitmatteDir": str(vitmatte_dir), "vitmatteCheckpoint": str(vitmatte_ckpt)})
-            step("Installing the GIMP plugin")
-            install_plugin(plugins_dir, settings)
+            with temp_on_disk(install_dir):
+                step("Creating virtual environment")
+                py = create_venv(install_dir / "venv")
+                step(f"Installing PyTorch ({index}) and SAM2")
+                install_sam2(py, index, src)
+                step("Fetching the SAM2 checkpoints")
+                checkpoints = install_dir / "checkpoints"
+                installed = {m: get_sam2_checkpoint(m, checkpoints, args.sam2_checkpoint) for m in models}
+                settings = {"pythonPath": str(py), "model": models[0],
+                            "models": {m: {"config": MODELS[m][0], "checkpoint": str(path)}
+                                       for m, path in installed.items()}}
+                if soft:
+                    step("Installing ViTMatte for soft edges")
+                    vitmatte_dir = install_soft_edges(py, src)
+                    vitmatte_ckpt = get_vitmatte_checkpoint(
+                        py, install_dir / "checkpoints" / "ViTMatte_B_DIS.pth", args.vitmatte_checkpoint)
+                    settings.update({"vitmatteDir": str(vitmatte_dir), "vitmatteCheckpoint": str(vitmatte_ckpt)})
+                step("Installing the GIMP plugin")
+                install_plugin(plugins_dir, settings)
         passed = run_tests(py, settings, plugins_dir / "aiselect", soft, index.startswith("cu"), gimp_console)
     except InstallError as e:
         print(f"\nERROR: {e}")
