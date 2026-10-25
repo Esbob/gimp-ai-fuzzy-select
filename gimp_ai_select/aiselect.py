@@ -223,20 +223,9 @@ class Backend:
                 req, callback, _, main_loop = self.queue.pop(0)
             reply = None
             try:
-                if self.sock is None and req.get("cmd") not in ("bye", "quit"):
-                    self._connect()
-                    if self.last_load and req.get("cmd") != "load":
-                        # A new connection after a lost one: the server may be a fresh one
-                        # that has never seen the image (a cached one answers at once).
-                        again = self._send(self.last_load)
-                        if not (again and again.get("ok")):
-                            raise RuntimeError("The image couldn't be sent to the restarted backend.")
-                if self.sock is not None:
-                    reply = self._send(req)
-                    if req.get("cmd") == "load" and reply and reply.get("ok"):
-                        self.last_load = req
-                elif req.get("cmd") in ("bye", "quit"):
-                    reply = {"ok": True}
+                reply = self._exchange(req)
+                if req.get("cmd") == "load" and reply and reply.get("ok"):
+                    self.last_load = req
             except RuntimeError as e:
                 reply = {"ok": False, "error": str(e)}
             except (OSError, ValueError):
@@ -251,6 +240,32 @@ class Backend:
             if req.get("cmd") in ("bye", "quit"):
                 self._disconnect()
                 return
+
+    def _exchange(self, req):
+        """Send `req` and return the reply, or None if the backend is gone. Connects first if
+        needed. A connection the server has closed meanwhile (it drops one that has been idle
+        for keepAliveMinutes, e.g. a window left open) is replaced once and the request sent
+        again; a new connection that fails is not retried."""
+        for _ in range(2):
+            new = self.sock is None
+            if new:
+                if req.get("cmd") in ("bye", "quit"):
+                    return {"ok": True}  # nothing to end
+                self._connect()
+                if self.last_load and req.get("cmd") != "load":
+                    # The server may be a fresh one that has never seen the image (one that
+                    # still has its analysis answers at once).
+                    again = self._send(self.last_load)
+                    if not (again and again.get("ok")):
+                        raise RuntimeError("The image couldn't be sent to the restarted backend.")
+            try:
+                reply = self._send(req)
+            except OSError:
+                reply = None
+            if reply is not None or new:
+                return reply
+            self._disconnect()
+        return None
 
     def close(self):
         """End this connection; the server stays loaded for the next run (unless

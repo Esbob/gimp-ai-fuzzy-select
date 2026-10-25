@@ -687,15 +687,24 @@ def listen(server, settings):
         json.dump(state, f)
     os.replace(tmp, state_file)
     print(f"listening on port {state['port']} (pid {os.getpid()}, version {VERSION})", flush=True)
+    # Waiting for a connection: at least a minute, so that with keepAliveMinutes 0 (stop when
+    # the window closes, which sends "quit") the plugin that started it can still connect. A
+    # timeout of 0 would make accept() non-blocking and fail at once.
+    accept_wait = max(keep_alive, 60)
+    # An open connection that sends nothing for this long is dropped. A plugin that went away
+    # without closing it (a crash, a killed process) otherwise kept the server waiting on it
+    # for good: answering no one, never reaching the idle exit. A window that was only left
+    # open reconnects by itself (Backend._exchange).
+    idle_wait = float(os.environ.get("AISELECT_IDLE_WAIT", max(keep_alive, 600)))  # (shorter in tests)
     try:
         while True:
-            sock.settimeout(keep_alive)
+            sock.settimeout(accept_wait)
             try:
                 conn, _ = sock.accept()
             except socket.timeout:
-                print(f"idle for {keep_alive:.0f} s, exiting", flush=True)
+                print(f"idle for {accept_wait:.0f} s, exiting", flush=True)
                 return
-            conn.settimeout(None)
+            conn.settimeout(10)  # the hello comes at once
             with conn, conn.makefile("r", encoding="utf-8", newline="\n") as rfile, \
                     conn.makefile("w", encoding="utf-8", newline="\n") as wfile:
                 try:
@@ -705,9 +714,13 @@ def listen(server, settings):
                     wfile.write(json.dumps({"id": hello.get("id"), "ok": True, "version": VERSION,
                                             "pid": os.getpid()}) + "\n")
                     wfile.flush()
+                    conn.settimeout(idle_wait)
                     if serve(server, rfile, wfile):
                         print("quit requested", flush=True)
                         return
+                except socket.timeout:
+                    print("connection silent too long (no hello in 10 s, or no request in "
+                          f"{idle_wait:.0f} s), closed", flush=True)
                 except (OSError, ValueError):
                     traceback.print_exc()  # the plugin went away mid-request; wait for the next
     finally:
