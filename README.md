@@ -6,8 +6,8 @@ selects by *object* instead of by *colour*: click on something in the image and
 out which pixels belong to it. The result is a normal GIMP selection with marching ants.
 
 <p align="center">
-  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download-button.png" width="300" alt="Download for GIMP 3"></a><br>
-  <sub>Unzip it and double-click <code>install.bat</code> · <a href="#installation">installation steps</a></sub>
+  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download-button.png" width="300" alt="Download for Windows"></a><br>
+  <sub>For GIMP 3 on Windows: unzip it and double-click <code>install.bat</code> · <a href="#installation">installation steps</a>, also for Linux and macOS (untested)</sub>
 </p>
 
 <img width="1920" height="1020" alt="AI_Fuzzy_Select" src="https://github.com/user-attachments/assets/2b375a6d-3563-4bd6-a517-694790976008" />
