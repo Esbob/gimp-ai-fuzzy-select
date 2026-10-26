@@ -18,6 +18,7 @@ https://github.com/user-attachments/assets/8a79728e-e93e-48f2-904d-6e7b5a6111e4
 
 - [What the plug-in does](#what-the-plug-in-does)
   - [Clicking and dragging](#clicking-and-dragging)
+  - [Slicing an image into layers](#slicing-an-image-into-layers)
   - [Options](#options)
   - [Viewing](#viewing)
   - [How it works](#how-it-works)
@@ -31,7 +32,8 @@ https://github.com/user-attachments/assets/8a79728e-e93e-48f2-904d-6e7b5a6111e4
 **Select > AI Fuzzy Select...** opens a window with your image (what is currently visible) and a
 compact options sidebar. GIMP plug-ins can't receive clicks on the canvas itself, so you
 click in this window; when you press **Select**, the result becomes GIMP's selection (or, if you
-choose, a new layer with a mask, a cut-out layer, a mask on the current layer, or a channel).
+choose, a new layer with a mask, a cut-out layer, a mask on the current layer, a channel, or
+the current layer sliced into a layer per object).
 
 ### Clicking and dragging
 
@@ -65,6 +67,28 @@ live as a tinted overlay with a dashed outline. The cursor looks
 like GIMP's Fuzzy Select cursor and shows **+** while Shift is held and **−** while Ctrl
 is held.
 
+### Slicing an image into layers
+
+With **Result: Slices**, the window cuts the current layer into a layer per object plus
+one for everything else (the rest):
+
+| Action | Effect |
+|---|---|
+| Click / Drag | Make the object a new slice |
+| Shift+click / Shift+drag | Add the object to the last slice, e.g. a second part of it |
+| Ctrl+click / Ctrl+drag | Give the object back to the rest |
+
+Each slice is shown in its own colour. Clicking an object inside a slice splits it in two:
+where objects overlap, the smaller one keeps the pixels, whichever you clicked first. So
+you can click a car and then its headlight, or the shopping bags first and then the car
+around them.
+
+**Slice** puts the slices and the rest in a new layer group right above the layer, each
+slice cropped to its object, and hides the original layer. Every pixel is in exactly one of
+them, so together they look exactly like the original layer, and merging the group gives it
+back pixel for pixel. That's why slices have hard edges: Soft edges and Feather are off
+while slicing.
+
 ### Options
 
 | Option | What it does |
@@ -77,7 +101,7 @@ is held.
 | Feather | Soften the selection edge, in pixels |
 | Sharper outlines | More accurate outlines on large photos, especially for small objects: each object is looked at again on a crop around it. Takes a few seconds per object, in the background; the preview updates when it's ready |
 | Soft edges (ViTMatte) | Turn fuzzy edges such as fur and hair into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte), picking out individual hairs near the object's outline. On hard edges it mostly makes the outline smoother and more accurate. The effect is best seen in the **Mask** view. The preview shows soft edges a moment after each change; pressing **Select** computes them at full resolution |
-| Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; or a **Channel**, leaving GIMP's selection alone. The button's label changes to match |
+| Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; a **Channel**, leaving GIMP's selection alone; or **Slices** (see [Slicing an image into layers](#slicing-an-image-into-layers)). The button's label changes to match |
 | Existing selection in GIMP | Only for a Selection result, and only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
 Your options are remembered between runs (saved when you confirm with the main button);

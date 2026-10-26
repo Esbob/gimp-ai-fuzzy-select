@@ -18,6 +18,10 @@ Whether a click means a whole object or a part of it follows the Granularity opt
 subtracting from or intersecting the current one), with optional grow/shrink,
 feathering and ViTMatte soft edges.
 
+Slicing (Result: "Slices") instead cuts the current layer into a layer per object plus
+one for the rest, in a new layer group: each click starts a new slice, and a click
+inside a slice splits it. Together the slices look exactly like the original layer.
+
 The models run in the plugin's own Python environment (made by install_ai_select.py)
 through aiselect_server.py, which stays alive while the window is open: SAM2 encodes the image once, then each click only
 runs its small decoder.
@@ -68,6 +72,15 @@ MODEL_LABELS = {
     "small": ("SAM 2.1 small", "faster"),
 }
 RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "sharp", "soft", "edge")
+
+
+def render_options(options):
+    """The render request's options. Slices have hard edges, so that each pixel is in
+    exactly one slice: no soft edges or feather."""
+    req = {key: options[key] for key in RENDER_OPTIONS}
+    if options.get("output") == "slices":
+        req.update(slices=True, soft=False, feather=0)
+    return req
 # Result choices: dropdown text and the label of the dialog's main button.
 OUTPUTS = {
     "selection": ("Selection", "_Select"),
@@ -75,7 +88,9 @@ OUTPUTS = {
     "cutout": ("New layer with only the object", "_Create cut-out"),
     "mask": ("Mask on current layer", "_Add mask"),
     "channel": ("Channel", "_Save channel"),
+    "slices": ("Slices: a layer per object", "_Slice"),
 }
+MAX_SLICES = 255  # the backend numbers the slices in 8 bits (0 = the rest)
 OPERATIONS = {
     "replace": Gimp.ChannelOps.REPLACE, "add": Gimp.ChannelOps.ADD,
     "subtract": Gimp.ChannelOps.SUBTRACT, "intersect": Gimp.ChannelOps.INTERSECT,
@@ -462,16 +477,9 @@ class AISelectDialog(Gtk.Dialog):
             label.get_style_context().add_class("heading")
             side.pack_start(label, False, False, 0)
 
-        help_label = Gtk.Label(xalign=0)
-        help_label.set_line_wrap(True)
-        help_label.set_markup(
-            "<b>Click</b> an object to select it\n"
-            "<b>Drag</b> a box around an object\n"
-            "<b>Shift</b> add · <b>Ctrl</b> remove (click or drag)\n"
-            "<b>Ctrl+Z</b> undo\n"
-            "<b>Ctrl+scroll</b> or <b>+ − 1</b> zoom\n"
-            "<b>Middle-drag</b> or scroll to pan")
-        side.pack_start(help_label, False, False, 0)
+        self.help_label = Gtk.Label(xalign=0)
+        self.help_label.set_line_wrap(True)
+        side.pack_start(self.help_label, False, False, 0)
 
         heading("Clicks")
         self.hover = Gtk.CheckButton(label="Show object under cursor")
@@ -555,7 +563,8 @@ class AISelectDialog(Gtk.Dialog):
         self.grow = spin(-100, 100, "grow")
         add_row("Grow/shrink (px)", self.grow, "Grow (positive) or shrink (negative) the selection")
         self.feather = spin(0, 200, "feather")
-        add_row("Feather (px)", self.feather, "Soften the selection edge by this radius")
+        self.feather_tip = "Soften the selection edge by this radius"
+        add_row("Feather (px)", self.feather, self.feather_tip)
 
         self.sharp = Gtk.CheckButton(label="Sharper outlines (slower)")
         self.sharp.set_active(self.options["sharp"])
@@ -574,13 +583,14 @@ class AISelectDialog(Gtk.Dialog):
 
         self.soft = Gtk.CheckButton(label="Soft edges (ViTMatte)")
         self.soft.set_active(self.options["soft"])
-        self.soft.set_tooltip_text(
+        self.soft_tip = (
             "Turns fuzzy edges such as fur and hair into a partial selection, picking out "
             "individual hairs near the object's outline. On hard edges it mostly makes the "
             "outline smoother and more accurate.\n\n"
             "The effect is best seen in the Mask view (View: Mask above the image, or the M "
             "key), where partially selected pixels show as grey. The preview shows soft edges "
             "a moment after each change; pressing Select computes them at full resolution.")
+        self.soft.set_tooltip_text(self.soft_tip)
         self.soft.connect("toggled", lambda w: self.option_changed("soft", w.get_active()))
         if not self.soft_available:
             self.soft.set_sensitive(False)
@@ -597,7 +607,10 @@ class AISelectDialog(Gtk.Dialog):
             "What the button at the bottom right creates: a selection; a copy of the current "
             "layer with the result as its layer mask (non-destructive: paint on the mask to fix "
             "it later); a copy with everything outside the object deleted (a plain cut-out); "
-            "the result as the current layer's mask; or a channel, leaving GIMP's selection alone")
+            "the result as the current layer's mask; a channel, leaving GIMP's selection alone; "
+            "or slices: the current layer cut into a layer per object plus one for the rest, in "
+            "a new layer group (the original is hidden). Each click makes a new slice, and a "
+            "click inside a slice splits it. Together the slices look exactly like the original.")
         self.output.connect("changed", lambda w: self.on_output_changed(w.get_active_id()))
         side.pack_start(self.output, False, False, 0)
 
@@ -698,10 +711,35 @@ class AISelectDialog(Gtk.Dialog):
                             soft=d["soft"] and self.soft_available)
         self.set_status("Options reset to their defaults.")
 
+    def slicing(self):
+        return self.options["output"] == "slices"
+
     def on_output_changed(self, output):
+        was_slicing = self.slicing()
         self.options["output"] = output
         self.existing_box.set_visible(output == "selection" and self.has_selection)
         self.select_button.set_label(OUTPUTS[output][1])
+        slicing = self.slicing()
+        if slicing:
+            first = ("<b>Click</b> an object: a new slice\n"
+                     "<b>Drag</b> a box: a new slice\n"
+                     "<b>Shift</b> add to the last slice · <b>Ctrl</b> back to the rest\n")
+        else:
+            first = ("<b>Click</b> an object to select it\n"
+                     "<b>Drag</b> a box around an object\n"
+                     "<b>Shift</b> add · <b>Ctrl</b> remove (click or drag)\n")
+        self.help_label.set_markup(first + "<b>Ctrl+Z</b> undo\n"
+                                   "<b>Ctrl+scroll</b> or <b>+ − 1</b> zoom\n"
+                                   "<b>Middle-drag</b> or scroll to pan")
+        # Slices have hard edges (see render_options)
+        hard = "Off for slices: each pixel goes to exactly one slice, so they add up to the original"
+        self.feather.set_sensitive(not slicing)
+        self.feather.set_tooltip_text(hard if slicing else self.feather_tip)
+        self.soft.set_sensitive(self.soft_available and not slicing)
+        if self.soft_available:
+            self.soft.set_tooltip_text(hard if slicing else self.soft_tip)
+        if slicing != was_slicing and self.objects:
+            self.render()
 
     def set_busy(self, message, error=False):
         """Busy: grey the image, disable the sidebar, show a spinner and `message` in the
@@ -988,11 +1026,15 @@ class AISelectDialog(Gtk.Dialog):
 
     def use_guide(self):
         """Select the object inside each separate area of GIMP's selection (its bounding box
-        plus a click at the point deepest inside it), starting over, as one undo step."""
+        plus a click at the point deepest inside it), starting over, as one undo step. When
+        slicing, each area becomes a slice."""
         if self.guide and self.ready:
             self.history.append(copy.deepcopy(self.objects))
             self.objects = [{"sign": 1, "box": g["box"], "points": [g["point"] + [1]]}
-                            for g in self.guide["prompts"]]
+                            for g in self.guide["prompts"][:MAX_SLICES]]
+            if self.slicing():
+                for number, obj in enumerate(self.objects, 1):
+                    obj["slice"] = number
             self.render()
 
     def add_click(self, point, shift=False, ctrl=False):
@@ -1002,12 +1044,20 @@ class AISelectDialog(Gtk.Dialog):
         """Like Fuzzy Select: a plain click or box starts over with that object, Shift adds
         it and Ctrl subtracts it. Each click or box is its own SAM2 prompt; for clicks,
         Granularity decides whether it means a whole object or a part, while a box says
-        that itself."""
+        that itself. When slicing, a plain click or box starts a new slice instead, Shift
+        adds to the last slice and Ctrl gives the area back to the rest; where objects
+        overlap the smaller one keeps the pixels (see slice_labels in aiselect_server.py)."""
         if ctrl and not self.objects:
             return  # nothing to remove from
-        self.history.append(copy.deepcopy(self.objects))
         new = dict(prompt, sign=-1 if ctrl else 1)
-        if shift or ctrl:
+        if self.slicing() and not ctrl:
+            numbers = [o.get("slice", 1) for o in self.objects if o["sign"] > 0]
+            new["slice"] = numbers[-1] if shift and numbers else max(numbers, default=0) + 1
+            if new["slice"] > MAX_SLICES:
+                self.set_status(f"At most {MAX_SLICES} slices: Shift+click adds to the last one.")
+                return
+        self.history.append(copy.deepcopy(self.objects))
+        if shift or ctrl or self.slicing():
             self.objects.append(new)
         else:
             self.objects = [new]
@@ -1148,9 +1198,7 @@ class AISelectDialog(Gtk.Dialog):
     # --- backend ---
 
     def render_request(self, final=False, out=None):
-        req = {"cmd": "render", "objects": self.objects, "final": final}
-        for key in RENDER_OPTIONS:
-            req[key] = self.options[key]
+        req = dict(render_options(self.options), cmd="render", objects=self.objects, final=final)
         if out:
             req["out"] = out
         return req
@@ -1188,7 +1236,7 @@ class AISelectDialog(Gtk.Dialog):
             self.soft_timer = GLib.timeout_add(500, self.request_soft_preview, version)
 
     def soft_on(self):
-        return self.options["soft"] and self.soft_available
+        return self.options["soft"] and self.soft_available and not self.slicing()
 
     def poll_sharp(self, version):
         """While sharper outlines are worked out in the background, ask every 300 ms
@@ -1325,6 +1373,9 @@ class AISelectDialog(Gtk.Dialog):
         if self.soft_on():
             (shown if soft else refining).append("soft edges")
         status = f"{pct:.1f}% of the image selected ({', '.join(parts)}"
+        if self.slicing():
+            n = len(reply["slices"])
+            status = f"{n} slice{'s' * (n != 1)}, " + status
         if shown:
             status += f", {' and '.join(shown)} shown"
         status += f", {reply['seconds']:.1f} s)" if soft else f", {reply['seconds'] * 1000:.0f} ms)"
@@ -1490,12 +1541,15 @@ def write_mask(drawable, data):
     drawable.update(0, 0, w, h)
 
 
-def crop_to_layer(data, image_w, image_h, layer):
+def crop_to_layer(data, image_w, image_h, layer, outside=0):
     """The part of an image-sized 8-bit mask that falls on `layer`. Layers can be smaller
-    than the image, shifted, or stick out of it; outside the image counts as unselected."""
+    than the image, shifted, or stick out of it; outside the image the mask is `outside`
+    (unselected by default)."""
     _, ox, oy = layer.get_offsets()
     lw, lh = layer.get_width(), layer.get_height()
-    out = bytearray(lw * lh)
+    if (ox, oy, lw, lh) == (0, 0, image_w, image_h):
+        return data
+    out = bytearray([outside]) * (lw * lh)
     x0, x1 = max(ox, 0), min(ox + lw, image_w)
     if x1 > x0:
         for y in range(max(oy, 0), min(oy + lh, image_h)):
@@ -1539,6 +1593,84 @@ def apply_selection(image, data, operation):
         write_mask(channel, data)
         image.select_item(OPERATIONS[operation], channel)
         image.remove_channel(channel)
+
+
+def apply_slices(image, raw_file, slices, layer):
+    """Slicing: a new layer group with a layer per slice (cropped to it) and one for the
+    rest, cut from a copy of `layer` (or of what's visible); `layer` is hidden. Every pixel
+    is in exactly one of them, so together they look exactly like the original.
+    `slices` is the backend's list ({"slice", "box"}); the raw file has each pixel's slice
+    number."""
+    w, h = image.get_width(), image.get_height()
+    with open(raw_file, "rb") as f:
+        data = f.read()
+    name = layer.get_name() if layer is not None else "Visible"
+    group = Gimp.GroupLayer.new(image, f"{name} (slices)")
+    group.set_mode(Gimp.LayerMode.PASS_THROUGH)  # each slice blends in as the original did
+    if layer is not None:  # right above the original
+        image.insert_layer(group, layer.get_parent(), image.get_item_position(layer))
+        source = layer.copy()
+    else:
+        image.insert_layer(group, None, 0)
+        source = Gimp.Layer.new_from_visible(image, image, name)
+    image.insert_layer(source, group, 0)
+    # GIMP ends a plug-in that writes to a locked layer: unlock the copies (they're ours)
+    # and lock them again afterwards.
+    locks = (source.get_lock_content(), source.get_lock_alpha(), source.get_lock_position())
+    source.set_lock_content(False)
+    source.set_lock_alpha(False)
+    source.set_lock_position(False)
+    if source.is_group():
+        source = source.merge()  # a group's pixels can't be cut; its merged copy's can
+    if source.get_mask() is not None:  # the layer's own mask: the slices look as it did
+        source.remove_mask(Gimp.MaskApplyMode.APPLY if source.get_apply_mask()
+                           else Gimp.MaskApplyMode.DISCARD)
+    if not source.has_alpha():
+        source.add_alpha()
+    pieces = []
+    for n, piece_info in enumerate(slices, 1):
+        piece = source.copy()
+        image.insert_layer(piece, group, 0)  # newer slices on top
+        piece.set_name(f"{name} slice {len(pieces) + 1}")
+        if cut_slice(image, piece, data, piece_info["slice"], piece_info["box"]):
+            pieces.append(piece)
+        else:  # (only on the canvas outside the layer)
+            image.remove_layer(piece)
+        Gimp.progress_update(n / (len(slices) + 1))
+    source.set_name(f"{name} rest")
+    if cut_slice(image, source, data, 0):
+        pieces.append(source)
+    else:  # everything is in a slice
+        image.remove_layer(source)
+    for piece in pieces:
+        piece.set_lock_content(locks[0])
+        piece.set_lock_alpha(locks[1])
+        piece.set_lock_position(locks[2])
+    if layer is not None:
+        layer.set_visible(False)
+    image.set_selected_layers([group])
+
+
+def cut_slice(image, piece, data, number, box=None):
+    """Keep only the pixels of `piece` in slice `number` (0 = the rest, which also keeps
+    what lies outside the image), cropping it to `box`. False if none are on the layer."""
+    w, h = image.get_width(), image.get_height()
+    if box:
+        _, ox, oy = piece.get_offsets()
+        x1, y1 = max(box[0], ox), max(box[1], oy)
+        x2, y2 = min(box[2], ox + piece.get_width()), min(box[3], oy + piece.get_height())
+        if x2 <= x1 or y2 <= y1:
+            return False
+        piece.resize(x2 - x1, y2 - y1, ox - x1, oy - y1)
+    keep = bytes(255 if value == number else 0 for value in range(256))
+    mask_data = crop_to_layer(data.translate(keep), w, h, piece, 255 if number == 0 else 0)
+    if not mask_data.strip(b"\0"):
+        return False
+    mask = piece.create_mask(Gimp.AddMaskType.WHITE)
+    piece.add_mask(mask)
+    write_mask(mask, mask_data)
+    piece.remove_mask(Gimp.MaskApplyMode.APPLY)
+    return True
 
 
 def apply_result(image, raw_file, output, operation, layer):
@@ -1728,10 +1860,11 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
                 return reply["error"]
 
         Gimp.progress_init("AI Fuzzy Select: creating the result...")
+        output = options.get("output", "selection")
+        if output not in OUTPUTS:
+            return f"Unknown result type {output!r}."
         out = os.path.join(work, "selection.raw")
-        req = {"cmd": "render", "objects": objects, "final": True, "out": out}
-        for key in RENDER_OPTIONS:
-            req[key] = options[key]
+        req = dict(render_options(options), cmd="render", objects=objects, final=True, out=out)
         reply = backend.call(req)
         log(f"final render reply={json.dumps(reply)} out_size="
             f"{os.path.getsize(out) if os.path.exists(out) else 'missing'}")
@@ -1739,13 +1872,13 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
             return reply["error"]
         if reply.get("area", 0) == 0:
             return "The selection came out empty (try a higher Threshold or another click)."
-        output = options.get("output", "selection")
-        if output not in OUTPUTS:
-            return f"Unknown result type {output!r}."
         image.undo_group_start()
         try:
             operation = options["operation"] if has_selection or not interactive else "replace"
-            error = apply_result(image, out, output, operation, layer)
+            if output == "slices":
+                error = apply_slices(image, out, reply["slices"], layer)
+            else:
+                error = apply_result(image, out, output, operation, layer)
         finally:
             image.undo_group_end()
         if error:
@@ -1784,7 +1917,8 @@ class AISelect(Gimp.PlugIn):
         rw = GObject.ParamFlags.READWRITE
         # Used when called from scripts (the window passes its own state).
         procedure.add_string_argument("objects", "Objects (JSON)",
-                                      'Clicks: [{"sign": 1, "points": [[x, y, 1]]}]', "[]", rw)
+                                      'Clicks: [{"sign": 1, "points": [[x, y, 1]]}]; for slices '
+                                      'each has a "slice" number too', "[]", rw)
         procedure.add_int_argument("threshold", "Threshold", "0-100, 50 = SAM2 default", 0, 100, 50, rw)
         procedure.add_string_argument("granularity", "Granularity", "auto, whole, part or detail", "auto", rw)
         procedure.add_int_argument("fill-holes", "Fill holes", "Fill enclosed holes up to this diameter (px); 0 = off", 0, 500, 0, rw)
@@ -1797,7 +1931,7 @@ class AISelect(Gimp.PlugIn):
         procedure.add_boolean_argument("soft", "Soft edges", "ViTMatte soft edges", False, rw)
         procedure.add_string_argument("operation", "Operation", "replace, add, subtract or intersect",
                                       "replace", rw)
-        procedure.add_string_argument("output", "Result", "selection, layer, cutout, mask or channel",
+        procedure.add_string_argument("output", "Result", "selection, layer, cutout, mask, channel or slices",
                                       "selection", rw)
         return procedure
 

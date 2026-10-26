@@ -588,6 +588,36 @@ res["guide_areas"] = len(call(cmd="load", image=os.path.join(work, "input.png"),
                               preview_width=400, preview_height=300, guide=os.path.join(work, "lasso.raw"))["guide"]["prompts"])
 res["hover_outline"] = len(hover["polygons"]) > 0 and int((hard > 0.5).sum()) == hover["area"]
 res["grow_bigger"] = bool((final(click, grow=5) > 0.5).sum() > (hard > 0.5).sum())
+# Slices: the disc, a box inside it (which splits it), the sky; then Ctrl gives the box back
+# to the rest. Where objects overlap the smaller one keeps the pixels, in either order;
+# every pixel is in one slice.
+disc, sky = hard > 0.5, final([{"sign": 1, "points": [[700, 80, 1]]}]) > 0.5
+inner = final([{"sign": 1, "box": [330, 230, 470, 370]}]) > 0.5
+objs = [dict(click[0], slice=1), {"sign": 1, "box": [330, 230, 470, 370], "slice": 2},
+        {"sign": 1, "points": [[700, 80, 1]], "slice": 3}]
+def slice_render(objects):
+    r = call(cmd="render", objects=objects, slices=True, final=True, out=out)
+    return np.fromfile(out, np.uint8).reshape(true.shape), r
+lab, r = slice_render(objs)
+want = {1: disc & ~inner, 2: inner, 3: sky & ~disc & ~inner}
+boxes = {s["slice"]: s["box"] for s in r["slices"]}
+def bbox(m):
+    ys, xs = np.nonzero(m)
+    return [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
+lab_rev, _ = slice_render([dict(objs[1], slice=1), dict(objs[0], slice=2), objs[2]])  # box first
+res["slices"] = {"right pixels": all(((lab == k) == m).all() for k, m in want.items()),
+                 "rest": bool(((lab == 0) == ~(disc | inner | sky)).all()),
+                 "split": bool(0 < inner.sum() < disc.sum() < sky.sum() and (inner & disc).sum() > 0.9 * inner.sum()),
+                 "either order": bool(((lab_rev == 1) == (lab == 2)).all() and ((lab_rev == 2) == (lab == 1)).all()
+                                      and ((lab_rev == 3) == (lab == 3)).all()),
+                 "boxes": boxes == {k: bbox(m) for k, m in want.items()}}
+lab, r = slice_render(objs + [{"sign": -1, "box": [330, 230, 470, 370]}])
+res["slices"]["ctrl gives back"] = bool(((lab == 0) == (~(disc | inner | sky) | inner)).all()
+                                        and [s["slice"] for s in r["slices"]] == [1, 3])
+t0 = time.time()
+r = call(cmd="render", objects=objs, slices=True, preview_out=os.path.join(work, "p5.png"))
+res["slice_preview_ms"] = round(1000 * (time.time() - t0))
+res["slices"]["preview"] = len(r["slices"]) == 3 and os.path.exists(r["preview"])
 t0 = time.time()
 res["mae_sharp"] = float(np.abs(final(click, sharp=True) - true).mean())
 res["sharp_s"] = round(time.time() - t0, 1)
@@ -651,12 +681,12 @@ try:
     w, h = img.get_width(), img.get_height()
     proc = Gimp.get_pdb().lookup_procedure("plug-in-ai-select")
     report["registered"] = proc is not None
-    def ai_select(operation, output="selection", drawables=None, image=None):
+    def ai_select(operation, output="selection", drawables=None, image=None, objects=None):
         cfg = proc.create_config()
         cfg.set_property("run-mode", Gimp.RunMode.NONINTERACTIVE)
         cfg.set_property("image", image or img)
         cfg.set_core_object_array("drawables", drawables or (image or img).get_layers())
-        cfg.set_property("objects", json.dumps([{"sign": 1, "points": [[400, 300, 1]]}]))
+        cfg.set_property("objects", json.dumps(objects or [{"sign": 1, "points": [[400, 300, 1]]}]))
         cfg.set_property("operation", operation)
         cfg.set_property("output", output)
         result = proc.run(cfg)
@@ -726,6 +756,39 @@ try:
                                                                     "R'G'B'A u8", Gegl.AbyssPolicy.NONE))[3] == 0}
     report["group_cutout"] = all(group_checks.values()) or str(
         dict(group_checks, error=last_error[0], gimp=Gimp.version(), top_layer=gcut.get_name()))
+    # Slices: a layer group right above the layer, with a layer per slice (cropped to it)
+    # and one for the rest; the layer is hidden, and the group looks exactly like it. Also
+    # for a layer that sticks out of the canvas: the rest keeps what's outside. (There just
+    # the disc: on the shifted image SAM2 takes the box for the whole disc.)
+    def pixels(layer):
+        return bytes(layer.get_buffer().get(Gegl.Rectangle.new(0, 0, layer.get_width(), layer.get_height()),
+                                            1.0, "R'G'B'A u8", Gegl.AbyssPolicy.NONE))
+    disc_slice = {"sign": 1, "points": [[400, 300, 1]], "slice": 1}
+    inner_slice = {"sign": 1, "box": [330, 230, 470, 370], "slice": 2}
+    sliced = {}
+    for case, shift, objects in (("layer", None, [disc_slice, inner_slice]),
+                                 ("shifted layer", (-50, -30), [disc_slice])):
+        simg = Gimp.file_load(Gimp.RunMode.NONINTERACTIVE, Gio.File.new_for_path(args["input"]))
+        orig = simg.get_layers()[0]
+        name = orig.get_name()
+        if shift:
+            orig.set_offsets(*shift)
+        made = ai_select("replace", "slices", [orig], image=simg, objects=objects)
+        top = simg.get_layers()[0]
+        kids = [k.get_name() for k in top.get_children()] if top.is_group() else []
+        dup = simg.duplicate()
+        merged = dup.merge_visible_layers(Gimp.MergeType.EXPAND_AS_NECESSARY)
+        same = (merged.get_offsets() == orig.get_offsets() and merged.get_width() == orig.get_width()
+                and merged.get_height() == orig.get_height() and pixels(merged) == pixels(orig))
+        dup.delete()
+        checks = {"ran": made, "group": top.is_group() and top.get_name() == f"{name} (slices)",
+                  "right above": [l.get_id() for l in simg.get_layers()] == [top.get_id(), orig.get_id()],
+                  "layers": kids == [f"{name} slice {n}" for n in range(len(objects), 0, -1)] + [f"{name} rest"],
+                  "cropped": top.is_group() and top.get_children()[0].get_width() < orig.get_width(),
+                  "original hidden": not orig.get_visible(), "looks exactly like the original": same}
+        sliced[case] = all(checks.values()) or dict(checks, error=last_error[0], layers=kids)
+        simg.delete()
+    report["slices"] = all(v is True for v in sliced.values()) or str(sliced)
     # A wrong option is refused before anything changes (no stray channel)
     channels = len(img.get_channels())
     report["bad_option"] = not ai_select("Add") and len(img.get_channels()) == channels
@@ -814,6 +877,17 @@ try:
         dlg.model.set_active_id(models[1])
         pump(lambda: dlg.ready and "selected" in dlg.status.get_text(), 300)
         res["model_switch"] = [dlg.options["model"], len(dlg.objects) == before, dlg.status.get_text()]
+    # Slices: each click a new slice, Shift adds to the last one (here taking part of the
+    # first), Ctrl gives back to the rest;
+    # soft edges and feather are off
+    dlg.output.set_active_id("slices")
+    dlg.clear()
+    click(400, 300)
+    click(700, 80)
+    click(330, 230, Gdk.ModifierType.SHIFT_MASK, (470, 370))  # a box inside the disc
+    res["slice_status"] = click(20, 500, Gdk.ModifierType.CONTROL_MASK, (60, 560))  # some sky
+    res["slice_numbers"] = [o.get("slice") for o in dlg.objects]
+    res["slice_hard_edges"] = not dlg.feather.get_sensitive() and not dlg.soft.get_sensitive()
 except Exception:
     import traceback
     res["exception"] = traceback.format_exc()
@@ -847,6 +921,9 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (r["mae_guide"] < 0.03, f"a rough GIMP selection finds the object inside it (error vs true alpha {r['mae_guide']:.4f})"),
         (r["guide_areas"] == 2, f"a GIMP selection with two separate areas gives one prompt each ({r['guide_areas']})"),
         (r["grow_bigger"], "grow enlarges the selection"),
+        (all(r["slices"].values()),
+         f"slices: a smaller object keeps its pixels in either order, Ctrl gives them back, every pixel in one "
+         f"({'OK' if all(r['slices'].values()) else r['slices']}; preview {r['slice_preview_ms']} ms)"),
         (r["mae_sharp"] <= r["mae_click"] + 0.002,
          f"sharper outlines work (error vs true alpha {r['mae_sharp']:.4f} vs {r['mae_click']:.4f}, {r['sharp_s']} s)"),
         # A hover during the refinement must not wait for it. (Both slow down together when
@@ -911,7 +988,7 @@ def run_gimp_test(py, gimp_console, work):
         f"new layer with mask: {report.get('layer_result')}; cut-out: {report.get('cutout_result')}; "
         f"channel: {report.get('channel_result')} "
         f"({time.time() - t0:.0f} s incl. GIMP start)")
-    unusual = {"locked layer": "locked_layer", "the script's drawable": "drawable_used",
+    unusual = {"slices": "slices", "locked layer": "locked_layer", "the script's drawable": "drawable_used",
                "group cut-out": "group_cutout", "a wrong option refused": "bad_option",
                "nothing visible": "all_hidden"}
     unusual_ok = all(report.get(k) is True for k in unusual.values())  # else: the details
@@ -937,12 +1014,15 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
     switch = r.get("model_switch")
     passed = (r["sidebar_disabled_while_loading"] and r["ready"] and r["sidebar_enabled_after"]
               and "selected" in r["click"] and r["objects"] == [1, 1, -1] and bool(r["box_object"]) and "1 box" in r["box_drag"] and r["shift_cursor"]
-              and r["select_enabled"] and (switch is None or (switch[1] and "selected" in switch[2])))
+              and r["select_enabled"] and (switch is None or (switch[1] and "selected" in switch[2]))
+              and r["slice_numbers"] == [1, 2, 2, None] and "2 slices" in r["slice_status"]
+              and r["slice_hard_edges"])
     (ok if passed else fail)(
         f"window: options disabled while loading {r['sidebar_disabled_while_loading']}, ready "
         f"{r['ready']}; click/Shift/Ctrl gave objects {r['objects']}; a drag made box {r['box_object']}; '+' cursor with Shift "
         f"{r['shift_cursor']}; status: {r['ctrl_click']!r}"
-        + (f"; switched to model {switch[0]}, clicks kept {switch[1]}: {switch[2]!r}" if switch else ""))
+        + (f"; switched to model {switch[0]}, clicks kept {switch[1]}: {switch[2]!r}" if switch else "")
+        + f"; slices {r['slice_numbers']}, soft edges and feather off {r['slice_hard_edges']}: {r['slice_status']!r}")
     return bool(passed)
 
 

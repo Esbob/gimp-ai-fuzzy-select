@@ -37,6 +37,16 @@ starts with {"cmd": "hello", "token": ...}.
       (with "soft_preview": "soft" edges too, computed at reduced size;
       "view": "mask" writes the selection as a white-on-black image instead).
       Final: write the full-size 8-bit selection to "out" (optionally with ViTMatte edges).
+      "slices": true slices the image instead: each object has a "slice" number (1-255,
+      default 1) and the objects are applied in order, a sign 1 object giving its pixels
+      to its slice (taking them from a bigger object's slice, not a smaller one's: a click
+      inside a slice splits it) and a sign -1 object giving them back to the rest (slice
+      0). Fill holes and
+      grow apply to each object; edges stay hard (no soft edges or feather), so every
+      pixel belongs to exactly one slice. The preview colours each slice; final writes
+      the slice number of each pixel (8-bit, image size) to "out". The reply's "slices"
+      lists the slices that have pixels: {"slice", "area"}, final also "box" [x1, y1,
+      x2, y2].
       "sharp": sharper outlines, worked out in the background; a preview uses the ones
       that are ready and the reply's "sharp_pending" counts those still being worked out
       ("sharp_refined": those used). A final render waits for them.
@@ -80,6 +90,10 @@ import numpy as np  # noqa: E402
 import torch  # noqa: E402
 
 TINT = (64, 160, 255)  # overlay colour (RGB)
+# Slices in the preview, in turn (RGB): colours that tell apart well next to each other.
+SLICE_COLOURS = [(230, 25, 75), (60, 180, 75), (255, 225, 25), (0, 130, 200), (245, 130, 48),
+                 (145, 30, 180), (70, 240, 240), (240, 50, 230), (210, 245, 60), (250, 190, 212),
+                 (0, 128, 128), (170, 110, 40)]
 
 
 class LoadFailed(Exception):
@@ -95,6 +109,13 @@ def fill_holes(mask, max_area):
     small = np.flatnonzero(enclosed & (area <= max_area))
     small = small[small > 0]
     return mask | np.isin(cc, small) if len(small) else mask
+
+
+def grow_mask(mask, px):
+    """Grow (px > 0) or shrink (px < 0) a boolean mask by a round brush."""
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * abs(px) + 1,) * 2)
+    m8 = mask.astype(np.uint8)
+    return (cv2.dilate(m8, k) if px > 0 else cv2.erode(m8, k)).astype(bool)
 
 
 class Server:
@@ -528,15 +549,12 @@ class Server:
             prompts.append({"box": [x, y, x + bw, y + bh], "point": [x + int(px), y + int(py)]})
         return {"prompts": prompts, "polygons": self.outline(guide)}
 
-    def selection(self, req):
-        """Combined boolean mask, before grow/feather."""
+    def object_masks(self, req):
+        """Each object's boolean mask, in order: (object, mask)."""
         # Threshold 50 is SAM2's own cut-off (logit 0); 100 selects more, 0 less. The
         # +-2 logit range keeps uncertain masks controllable: at +-5 a two-click forest
         # selection swung from 0% to 47% of the image.
         cut = (50 - req.get("threshold", 50)) / 25.0
-        h, w = self.image.shape[:2]
-        add = np.zeros((h, w), bool)
-        sub = np.zeros((h, w), bool)
         granularity = req.get("granularity", "auto")
         sharp = bool(req.get("sharp"))
         wanted = {self.sharp_key(o, granularity) for o in req["objects"]} if sharp else set()
@@ -570,12 +588,44 @@ class Server:
                     mask |= self.object_logits([[x, y, 1]], "detail") > cut
                 elif label == 0 and mask[y, x]:
                     mask &= ~(self.object_logits([[x, y, 1]], "detail") > cut)
+            yield obj, mask
+        self.prune_cache()
+
+    def selection(self, req):
+        """Combined boolean mask, before grow/feather."""
+        h, w = self.image.shape[:2]
+        add = np.zeros((h, w), bool)
+        sub = np.zeros((h, w), bool)
+        for obj, mask in self.object_masks(req):
             if obj["sign"] > 0:
                 add |= mask
             else:
                 sub |= mask
-        self.prune_cache()
         return add & ~sub
+
+    def slice_labels(self, req):
+        """For slicing: the slice number of each pixel (0 = the rest). Where objects overlap,
+        the smaller one keeps the pixels, whichever came first: an object clicked inside a
+        slice splits it, and a big object clicked later (the car around four shopping bags)
+        doesn't take the stray bits of its mask that lie on the smaller ones."""
+        h, w = self.image.shape[:2]
+        labels = np.zeros((h, w), np.uint8)
+        owner = np.full((h, w), np.iinfo(np.uint32).max, np.uint32)  # area of each pixel's object
+        fill, grow = float(req.get("fill_holes", 0)), int(req.get("grow", 0))
+        for obj, mask in self.object_masks(req):
+            if obj["sign"] > 0 and fill > 0 and mask.any():
+                mask = fill_holes(mask, np.pi * (fill / 2) ** 2)
+            if grow and mask.any():  # growing the result means giving less back to the rest
+                mask = grow_mask(mask, grow if obj["sign"] > 0 else -grow)
+            if obj["sign"] > 0:
+                area = int(mask.sum())
+                mask &= owner >= area  # (the same size: the newer one)
+                labels[mask] = obj.get("slice", 1)
+                owner[mask] = area
+            else:  # back to the rest, which later objects can take again
+                labels[mask] = 0
+                owner[mask] = np.iinfo(np.uint32).max
+        return labels
 
     def prune_cache(self):
         """Drop the oldest results of objects not in the current selection beyond
@@ -624,6 +674,8 @@ class Server:
         return out
 
     def cmd_render(self, req):
+        if req.get("slices"):
+            return self.render_slices(req)
         t0 = time.time()
         mask = self.selection(req)
         fill = float(req.get("fill_holes", 0))
@@ -632,9 +684,7 @@ class Server:
         area = int(mask.sum())
         grow = int(req.get("grow", 0))
         if grow and area:
-            k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * abs(grow) + 1,) * 2)
-            m8 = mask.astype(np.uint8)
-            mask = (cv2.dilate(m8, k) if grow > 0 else cv2.erode(m8, k)).astype(bool)
+            mask = grow_mask(mask, grow)
         if req.get("soft") and mask.any() and (req.get("final") or req.get("soft_preview")):
             # Previews use a reduced-size crop: seconds become a fraction of a second.
             max_side = None if req.get("final") else int(req.get("soft_preview_size", 1024))
@@ -657,6 +707,49 @@ class Server:
             return {"area": area, "seconds": round(time.time() - t0, 3), "preview": path,
                     "sharp_pending": self.sharp_pending, "sharp_refined": self.sharp_refined}
         return {"area": area, "seconds": round(time.time() - t0, 3), "sharp_refined": self.sharp_refined}
+
+    def render_slices(self, req):
+        t0 = time.time()
+        labels = self.slice_labels(req)
+        counts = np.bincount(labels.ravel(), minlength=256)
+        slices = [{"slice": int(k), "area": int(counts[k])} for k in np.flatnonzero(counts[1:]) + 1]
+        reply = {"area": int(counts[1:].sum()), "slices": slices}
+        if req.get("final"):
+            for s in slices:
+                x, y, bw, bh = cv2.boundingRect((labels == s["slice"]).view(np.uint8))
+                s["box"] = [x, y, x + bw, y + bh]
+            with open(req["out"], "wb") as f:
+                f.write(labels.tobytes())
+        else:
+            path = req.get("preview_out") or self.preview_path
+            self.write_slice_preview(labels, path, req.get("view", "overlay"))
+            reply.update(preview=path, sharp_pending=self.sharp_pending)
+        return dict(reply, seconds=round(time.time() - t0, 3), sharp_refined=self.sharp_refined)
+
+    def write_slice_preview(self, labels, path, view="overlay"):
+        """Each slice in its own colour, with an outline; the rest is left clear (black in
+        the Mask view)."""
+        pw, ph = self.preview_size
+        small = cv2.resize(labels, (pw, ph), interpolation=cv2.INTER_NEAREST)
+        palette = np.zeros((256, 3), np.uint8)
+        palette[1:] = [SLICE_COLOURS[i % len(SLICE_COLOURS)] for i in range(255)]
+        if view == "mask":
+            cv2.imwrite(path, cv2.cvtColor(palette[small], cv2.COLOR_RGB2BGR))
+            return
+        overlay = np.zeros((ph, pw, 4), np.uint8)
+        overlay[..., :3] = palette[small]
+        overlay[..., 3] = np.where(small > 0, 120, 0)
+        for k in np.unique(small):
+            if k == 0:
+                continue
+            contours, _ = cv2.findContours((small == k).view(np.uint8), cv2.RETR_LIST,
+                                           cv2.CHAIN_APPROX_NONE)
+            for contour in contours:
+                xy = contour[:, 0]
+                dash = (np.arange(len(xy)) // 4) % 2 == 1
+                overlay[xy[:, 1], xy[:, 0]] = (0, 0, 0, 255)
+                overlay[xy[dash, 1], xy[dash, 0]] = (255, 255, 255, 255)
+        cv2.imwrite(path, cv2.cvtColor(overlay, cv2.COLOR_RGBA2BGRA))
 
     def write_preview(self, alpha, path, view="overlay"):
         pw, ph = self.preview_size
