@@ -19,6 +19,7 @@ https://github.com/user-attachments/assets/8a79728e-e93e-48f2-904d-6e7b5a6111e4
 - [What the plug-in does](#what-the-plug-in-does)
   - [Clicking and dragging](#clicking-and-dragging)
   - [Slicing an image into layers](#slicing-an-image-into-layers)
+  - [Removing an object](#removing-an-object)
   - [Options](#options)
   - [Viewing](#viewing)
   - [How it works](#how-it-works)
@@ -32,8 +33,8 @@ https://github.com/user-attachments/assets/8a79728e-e93e-48f2-904d-6e7b5a6111e4
 **Select > AI Fuzzy Select...** opens a window with your image (what is currently visible) and a
 compact options sidebar. GIMP plug-ins can't receive clicks on the canvas itself, so you
 click in this window; when you press **Select**, the result becomes GIMP's selection (or, if you
-choose, a new layer with a mask, a cut-out layer, a mask on the current layer, a channel, or
-the current layer sliced into a layer per object).
+choose, a new layer with a mask, a cut-out layer, a mask on the current layer, a channel,
+the current layer sliced into a layer per object, or the object removed).
 
 ### Clicking and dragging
 
@@ -89,6 +90,33 @@ them, so together they look exactly like the original layer, and merging the gro
 back pixel for pixel. That's why slices have hard edges: Soft edges and Feather are off
 while slicing.
 
+### Removing an object
+
+With **Result: Remove the object**, pressing **Remove** covers the object with background
+made up by [LaMa](https://github.com/advimman/lama), an AI model for filling in parts of an
+image: click a sign, a bin, a cable or a passer-by and it's gone. The background goes on
+a new layer right above the current layer, cropped to the object and transparent around it,
+so the original stays untouched: hide or delete that layer to bring the object back, or erase
+parts of it.
+
+You see the result before pressing Remove: the **Result** view (next to Overlay and Mask;
+the **R** key switches to it and back) shows the image with the object removed, at full
+resolution, a moment after each change; until it's ready the pointer over the image shows
+that it's busy. The **Surroundings** slider sets how much of the image around the object is
+used to make up the background: lower makes it from what's right next to the object, often
+sharper; higher uses more of the image, which can help for larger objects (20 by default; it
+works like cropping the image around the object, by that percentage of the object's size on
+each side, before removing it). Pressing **Remove** then uses the result you see, without
+working it out again.
+
+It works best when the background continues simply around the object (a street, a wall, sky,
+grass): even a whole truck in front of a wall can be removed. Behind a large object in a
+busy or dark scene it makes up less convincing background, often a smudge. The object's
+shadow isn't part of the object: add it with Shift+drag, or it stays. A long, thin object
+across much of the image, such as a road marking, is filled at a lower resolution and comes
+out softer. Soft edges and Feather are off for this result. On the GTX 1050 Ti the result
+takes about 1-3 seconds (the first time a few seconds more, to load LaMa).
+
 ### Options
 
 | Option | What it does |
@@ -101,7 +129,8 @@ while slicing.
 | Feather | Soften the selection edge, in pixels |
 | Sharper outlines | More accurate outlines on large photos, especially for small objects: each object is looked at again on a crop around it. Takes a few seconds per object, in the background; the preview updates when it's ready |
 | Soft edges (ViTMatte) | Turn fuzzy edges such as fur and hair into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte), picking out individual hairs near the object's outline. On hard edges it mostly makes the outline smoother and more accurate. The effect is best seen in the **Mask** view. The preview shows soft edges a moment after each change; pressing **Select** computes them at full resolution |
-| Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; a **Channel**, leaving GIMP's selection alone; or **Slices** (see [Slicing an image into layers](#slicing-an-image-into-layers)). The button's label changes to match |
+| Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; a **Channel**, leaving GIMP's selection alone; **Slices** (see [Slicing an image into layers](#slicing-an-image-into-layers)); or **Remove the object** (see [Removing an object](#removing-an-object)). The button's label changes to match |
+| Surroundings | Only for **Remove the object**: how much of the image around the object is used to make up the background (see [Removing an object](#removing-an-object)) |
 | Existing selection in GIMP | Only for a Selection result, and only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
 Your options are remembered between runs (saved when you confirm with the main button);
@@ -117,7 +146,8 @@ button.
 The **View** buttons switch between **Overlay** (the selection as a tinted overlay on the
 image) and **Mask** (the selection itself, white on black, like a GIMP channel), also with
 the **M** key. Mask view is the way to see soft edges and feathering: partially selected
-pixels show as grey.
+pixels show as grey. When removing an object, **Result** (or the **R** key) shows the object
+removed.
 
 ### How it works
 
@@ -157,7 +187,8 @@ installer and uninstaller stop a running backend before changing its files.
   support that CUDA version. Without an NVIDIA GPU everything runs on the CPU; this is
   untested and analysing the image will be much slower.
 - **Disk space:** about 6 GB (PyTorch and other packages 4.4 GB, SAM 2.1 large and small
-  1.1 GB, ViTMatte checkpoint and code 0.5 GB); about 0.5 GB less with `--no-soft-edges`.
+  1.1 GB, ViTMatte checkpoint and code 0.5 GB, LaMa 0.2 GB); about 0.5 GB less with
+  `--no-soft-edges`.
 - **Internet access** during installation, to download the packages and checkpoints.
 - **Operating system:** tested on Windows 11 (GIMP 3.2.6) and Ubuntu 26.04 (GIMP 3 from
   apt), both with an NVIDIA GPU. The installer contains code for macOS, but **it has not
@@ -181,9 +212,9 @@ On Windows:
 5. **Start GIMP** (restart it if it's open) and use **Select > AI Fuzzy Select...**
 
 The installer creates a virtual environment in `%LOCALAPPDATA%\gimp-ai-select`, installs
-PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the checkpoints, copies
-the plug-in into GIMP's `plug-ins` folder and runs the tests. The unzipped folder isn't
-needed afterwards, except for uninstalling.
+PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the checkpoints (and
+LaMa, for removing objects), copies the plug-in into GIMP's `plug-ins` folder and runs the
+tests. The unzipped folder isn't needed afterwards, except for uninstalling.
 
 On Linux and macOS (macOS untested): download and unzip the same zip, then run `sh install.sh` in
 that folder in a terminal; on macOS you can instead double-click `install.command` (the first
@@ -241,6 +272,7 @@ versions:
 
 - [SAM 2](https://github.com/facebookresearch/sam2) and its SAM 2.1 checkpoints, by Meta (Apache 2.0)
 - ViTMatte code and checkpoint from [Matte Anything](https://github.com/hustvl/Matte-Anything) (MIT), for soft edges
+- [LaMa](https://github.com/advimman/lama) by Samsung AI Center (Apache 2.0), for removing objects, as the TorchScript file [IOPaint](https://github.com/Sanster/IOPaint) uses
 - [detectron2](https://github.com/facebookresearch/detectron2) by Meta (Apache 2.0), for loading ViTMatte
 
 <sub>[↑ Back to contents](#contents)</sub>

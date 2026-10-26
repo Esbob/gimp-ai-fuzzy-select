@@ -37,6 +37,11 @@ starts with {"cmd": "hello", "token": ...}.
       (with "soft_preview": "soft" edges too, computed at reduced size;
       "view": "mask" writes the selection as a white-on-black image instead).
       Final: write the full-size 8-bit selection to "out" (optionally with ViTMatte edges).
+      With "patch_out", also remove the object: the background LaMa makes up for it (see
+      remove_patch), written as 8-bit RGBA for the box in the reply's "patch_box";
+      "remove_context": the area around the object LaMa sees, in % of its size (default 20).
+      Not final, with "remove_preview": only that patch, as a PNG at full resolution (a
+      final render with the same selection and context then reuses it).
       "slices": true slices the image instead: each object has a "slice" number (1-255,
       default 1) and the objects are applied in order, a sign 1 object giving its pixels
       to its slice (taking them from a bigger object's slice, not a smaller one's: a click
@@ -84,6 +89,12 @@ IMAGE_CACHE_SIZE = 4  # images whose SAM2 analysis is kept (about 16 MB of GPU m
 # kept up to this many bytes, oldest dropped first: each is 4 bytes per pixel (192 MB on an
 # 8000x6000 photo), and keeping every click of a session reached 10 GB in a test.
 SPARE_CACHE_BYTES = 1 << 30
+# LaMa fills each area on a crop scaled down to at most this many pixels: on real photos 512
+# kept walls, kerbs and lines going where 1024 and 2048 smeared a large hole (LaMa was
+# trained on small crops, so the hole should be small in pixels too).
+LAMA_SIDE = 512
+REMOVE_CONTEXT = 20  # around an object to remove, this % of its size is LaMa's context (default)
+REMOVE_MARGIN = 0.02  # and this much is filled in with it (its edge pixels)
 
 import cv2  # noqa: E402
 import numpy as np  # noqa: E402
@@ -111,6 +122,12 @@ def fill_holes(mask, max_area):
     return mask | np.isin(cc, small) if len(small) else mask
 
 
+def disk_dilate(mask, r):
+    """`mask` (bool) grown by a disc of radius r: a distance transform, which unlike cv2.dilate
+    with an elliptical kernel costs the same for any r (r reached hundreds of pixels)."""
+    return cv2.distanceTransform((~mask).view(np.uint8), cv2.DIST_L2, 5) <= r
+
+
 def grow_mask(mask, px):
     """Grow (px > 0) or shrink (px < 0) a boolean mask by a round brush."""
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * abs(px) + 1,) * 2)
@@ -131,6 +148,9 @@ class Server:
         self.predictor = None
         self.model_name = None  # the SAM2 model loaded (see model_spec)
         self.vitmatte = None
+        self.lama = None  # for removing objects, loaded when first needed
+        self.last_patch = None  # (image, selection hash, context, box, RGBA): the last removal
+        self.lama_device = None
         self.image = None
         # (granularity, points) or ("box", ...) -> (full-res logits, low-res logits), oldest
         # first; see prune_cache
@@ -182,7 +202,7 @@ class Server:
         whether the analysis was reused."""
         if self.predictor is None or (name, device) != (self.model_name, self.device):
             if device != self.device:
-                self.vitmatte = None  # loaded again on the new device when needed
+                self.vitmatte = self.lama = self.lama_device = None  # loaded again on the new device when needed
             self.device = device
             self.load_sam2(name)
         key += name + device
@@ -245,10 +265,137 @@ class Server:
         DetectionCheckpointer(model).load(checkpoint)
         self.vitmatte = model
 
+    def free_lama(self):
+        """Give LaMa's GPU memory back (about 200 MB): on a 4 GB GPU SAM2 or ViTMatte may need
+        it. LaMa loads again in a second or two when an object is next removed."""
+        if self.lama is not None and self.lama_device == "cuda":
+            self.lama = self.lama_device = None
+            torch.cuda.empty_cache()
+
+    def lama_fill(self, image, mask):
+        """LaMa's background for the pixels in `mask` (HxW uint8, 1 = fill) of `image` (HxWx3
+        uint8, sides a multiple of 8). On a GPU without enough memory left (for loading LaMa
+        or for running it), on the CPU, from then on."""
+        path = self.settings.get("lamaCheckpoint")
+        if not path:
+            raise RuntimeError("Removing objects isn't installed: run the installer again.")
+        for device in dict.fromkeys([self.lama_device or self.device, "cpu"]):
+            try:
+                if self.lama is None or device != self.lama_device:
+                    self.lama = None  # (frees the GPU's copy first)
+                    self.lama = torch.jit.load(path, map_location=device).eval()
+                    self.lama_device = device
+                with torch.no_grad():
+                    img = torch.from_numpy(image).permute(2, 0, 1)[None].float().to(device) / 255
+                    out = self.lama(img, torch.from_numpy(mask)[None, None].float().to(device))
+                    return out[0].permute(1, 2, 0).clamp(0, 1).mul(255).round().byte().cpu().numpy()
+            except RuntimeError as e:  # (inside TorchScript, running out of memory is a RuntimeError)
+                if device == "cpu" or "out of memory" not in str(e):
+                    raise
+                self.lama = None
+                torch.cuda.empty_cache()
+
+    def remove_patch(self, mask, path, context=REMOVE_CONTEXT, png=False):
+        """For removing the object in `mask` (bool, image size): a patch of background made up
+        by LaMa. Each separate part is filled as if the photo had been cropped around it
+        first, with `context` % of the part's size on each side, scaled down to LAMA_SIDE px
+        and the result scaled back up. The patch covers the part and a margin of
+        REMOVE_MARGIN of its size, where its edge colours still show. Both follow the object,
+        not the photo: sized by the photo, a street sign in a 4000 px photo was filled at a
+        quarter of its resolution, a soft patch. Writes the box around the patch as 8-bit
+        RGBA (A = 255 in the patch; as PNG with png=True) and returns the box."""
+        key = hashlib.sha1(mask.tobytes()).hexdigest()
+        last = self.last_patch
+        if last and last[0] is self.image and last[1:3] == (key, context):  # e.g. shown in the window
+            box, out = last[3], last[4]
+        else:
+            box, out = self.make_patch(mask, context)
+            self.last_patch = (self.image, key, context, box, out)
+        if png:
+            cv2.imwrite(path, cv2.cvtColor(out, cv2.COLOR_RGBA2BGRA), [cv2.IMWRITE_PNG_COMPRESSION, 1])
+        else:
+            with open(path, "wb") as f:
+                f.write(out.tobytes())
+        return box
+
+    def make_patch(self, mask, context):
+        h, w = mask.shape
+        image = self.image.copy()  # filled area by area: areas filled earlier are context
+        patch = np.zeros((h, w), bool)
+        # Each piece of the selection reaches twice its margin (REMOVE_MARGIN of its own size);
+        # pieces that reach each other are one part, with the biggest one's margin: a car's
+        # side mirror, a few pixels off the car, is filled with the car (on its own it got a
+        # tiny margin and left its bright edge behind). Margins by the size of the whole
+        # selection instead chained objects at opposite sides of the photo (through stray
+        # bits in between) into one part, with one crop over much of the photo.
+        n, pieces, stats, _ = cv2.connectedComponentsWithStats(mask.view(np.uint8), connectivity=8)
+        reach = np.zeros((h, w), bool)
+        margins = [0] * n
+        for j in range(1, n):
+            x, y, pw, ph = (int(v) for v in stats[j, :4])
+            g = margins[j] = max(4, round(max(pw, ph) * REMOVE_MARGIN))
+            r = 2 * g
+            x1, y1, x2, y2 = max(x - r, 0), max(y - r, 0), min(x + pw + r, w), min(y + ph + r, h)
+            reach[y1:y2, x1:x2] |= disk_dilate(pieces[y1:y2, x1:x2] == j, r)
+        n, parts, stats_parts, _ = cv2.connectedComponentsWithStats(reach.view(np.uint8), connectivity=8)
+        grows = [4] * n
+        for j in range(1, len(margins)):
+            x, y, pw, ph = (int(v) for v in stats[j, :4])
+            part = int(parts[y:y + ph, x:x + pw][pieces[y:y + ph, x:x + pw] == j][0])
+            grows[part] = max(grows[part], margins[j])
+        # Each part's crop and hole (the part and its margin)
+        crops = []
+        for i in range(1, n):
+            px, py, pw, ph = (int(v) for v in stats_parts[i, :4])
+            grow = grows[i]
+            side = max(pw, ph) - 4 * grow  # (the part's size, without its reach)
+            m = max(16, round(side * context / 100)) + grow
+            box = (max(px - m, 0), max(py - m, 0), min(px + pw + m, w), min(py + ph + m, h))
+            x1, y1, x2, y2 = box
+            crops.append((box, disk_dilate((parts[y1:y2, x1:x2] == i) & mask[y1:y2, x1:x2], grow)))
+        # Parts whose crops fit together without making the bigger one larger than LAMA_SIDE
+        # (or than it was) are filled in one go: 200 specks of foliage took 200 LaMa runs
+        areas = []  # [box, its long side to stay within, [(box, hole), ...]]
+        for box, hole in sorted(crops, key=lambda c: -max(c[0][2] - c[0][0], c[0][3] - c[0][1])):
+            for area in areas:
+                u = (min(area[0][0], box[0]), min(area[0][1], box[1]), max(area[0][2], box[2]),
+                     max(area[0][3], box[3]))
+                if max(u[2] - u[0], u[3] - u[1]) <= area[1]:
+                    area[0] = u
+                    area[2].append((box, hole))
+                    break
+            else:
+                areas.append([box, max(LAMA_SIDE, box[2] - box[0], box[3] - box[1]), [(box, hole)]])
+        for (x1, y1, x2, y2), _, members in areas:
+            hole = np.zeros((y2 - y1, x2 - x1), bool)
+            for (bx1, by1, bx2, by2), part_hole in members:
+                hole[by1 - y1:by2 - y1, bx1 - x1:bx2 - x1] |= part_hole
+            crop = image[y1:y2, x1:x2]
+            ch, cw = hole.shape
+            scale = min(1.0, LAMA_SIDE / max(ch, cw))
+            size = (max(8, round(cw * scale)), max(8, round(ch * scale)))
+            small = cv2.resize(crop, size, interpolation=cv2.INTER_AREA)
+            small_hole = cv2.dilate(cv2.resize(hole.view(np.uint8), size, interpolation=cv2.INTER_NEAREST),
+                                    np.ones((3, 3), np.uint8))
+            pad = ((0, -size[1] % 8), (0, -size[0] % 8))
+            result = self.lama_fill(np.pad(small, pad + ((0, 0),), mode="reflect"),
+                                    np.pad(small_hole, pad, mode="reflect"))[:size[1], :size[0]]
+            if scale < 1:
+                result = cv2.resize(result, (cw, ch), interpolation=cv2.INTER_CUBIC)
+            crop[hole] = result[hole]
+            patch[y1:y2, x1:x2] |= hole
+        x, y, bw, bh = cv2.boundingRect(patch.view(np.uint8))
+        out = np.zeros((bh, bw, 4), np.uint8)
+        out[..., :3] = image[y:y + bh, x:x + bw]
+        out[..., 3] = patch[y:y + bh, x:x + bw] * 255
+        return [x, y, x + bw, y + bh], out
+
     # --- commands ------------------------------------------------------------------
 
     def cmd_load(self, req):
         t0 = time.time()
+        self.last_patch = None  # (it holds on to the previous image)
+        self.free_lama()  # analysing the image needs the GPU memory more
         wanted = self.model_spec(req.get("model"))[0]
         if req.get("width"):  # raw 8-bit RGBA from the plugin
             rgba = np.fromfile(req["image"], np.uint8).reshape(req["height"], req["width"], 4)
@@ -642,6 +789,7 @@ class Server:
         max_side: for previews, run ViTMatte on the crop scaled down to at most this many
         pixels on its long side (much faster) and scale the alpha back up."""
         if self.vitmatte is None:
+            self.free_lama()
             self.load_vitmatte()
         h, w = mask.shape
         ys, xs = np.nonzero(mask)
@@ -681,10 +829,10 @@ class Server:
         fill = float(req.get("fill_holes", 0))
         if fill > 0 and mask.any():
             mask = fill_holes(mask, np.pi * (fill / 2) ** 2)
-        area = int(mask.sum())
         grow = int(req.get("grow", 0))
-        if grow and area:
+        if grow and mask.any():
             mask = grow_mask(mask, grow)
+        area = int(mask.sum())  # (after shrinking, which can leave nothing)
         if req.get("soft") and mask.any() and (req.get("final") or req.get("soft_preview")):
             # Previews use a reduced-size crop: seconds become a fraction of a second.
             max_side = None if req.get("final") else int(req.get("soft_preview_size", 1024))
@@ -700,6 +848,15 @@ class Server:
             alpha8 = np.round(np.clip(alpha, 0, 1) * 255).astype(np.uint8)
             with open(req["out"], "wb") as f:
                 f.write(np.ascontiguousarray(alpha8).tobytes())
+            if req.get("patch_out") and area:
+                box = self.remove_patch(alpha > 0.5, req["patch_out"], req.get("remove_context", REMOVE_CONTEXT))
+                return {"area": area, "seconds": round(time.time() - t0, 3), "sharp_refined": self.sharp_refined,
+                        "patch_box": box}
+        elif req.get("remove_preview"):
+            box = self.remove_patch(alpha > 0.5, req["remove_preview"], req.get("remove_context", REMOVE_CONTEXT),
+                                    png=True) if area else None
+            return {"area": area, "seconds": round(time.time() - t0, 3), "patch": req["remove_preview"],
+                    "patch_box": box, "sharp_pending": self.sharp_pending}
         else:
             # A fresh file per preview, so the window can read one while the next is written.
             path = req.get("preview_out") or self.preview_path

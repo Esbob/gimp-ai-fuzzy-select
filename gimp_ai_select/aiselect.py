@@ -22,6 +22,9 @@ Slicing (Result: "Slices") instead cuts the current layer into a layer per objec
 one for the rest, in a new layer group: each click starts a new slice, and a click
 inside a slice splits it. Together the slices look exactly like the original layer.
 
+"Remove the object" covers the object with background made up by LaMa, on a new layer
+above the current one.
+
 The models run in the plugin's own Python environment (made by install_ai_select.py)
 through aiselect_server.py, which stays alive while the window is open: SAM2 encodes the image once, then each click only
 runs its small decoder.
@@ -62,7 +65,7 @@ PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 
 DEFAULT_OPTIONS = {
     "output": "selection", "hover": True, "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
-    "sharp": False, "soft": False, "edge": 4, "operation": "replace",
+    "sharp": False, "soft": False, "edge": 4, "operation": "replace", "remove_context": 20,
     "model": "",  # "" = the installed default (aiselect_settings.json)
 }
 # SAM 2.1 models the installer can set up: dropdown text and tooltip. (On real photos large
@@ -71,16 +74,30 @@ MODEL_LABELS = {
     "large": ("SAM 2.1 large", "best quality"),
     "small": ("SAM 2.1 small", "faster"),
 }
-RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "sharp", "soft", "edge")
+RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "sharp", "soft", "edge",
+                  "remove_context")
+
+
+# Results with hard edges (no soft edges or feather): slices, so that each pixel is in
+# exactly one slice; removing an object, which fills it in with background.
+HARD_EDGES = {
+    "slices": "Off for slices: each pixel goes to exactly one slice, so they add up to the original",
+    "remove": "Off for removing an object: it is filled in with background",
+}
 
 
 def render_options(options):
-    """The render request's options. Slices have hard edges, so that each pixel is in
-    exactly one slice: no soft edges or feather."""
+    """The render request's options (see HARD_EDGES)."""
     req = {key: options[key] for key in RENDER_OPTIONS}
+    if options.get("output") in HARD_EDGES:
+        req.update(soft=False, feather=0)
     if options.get("output") == "slices":
-        req.update(slices=True, soft=False, feather=0)
+        req["slices"] = True
     return req
+
+
+def remove_available(settings):
+    return bool(settings.get("lamaCheckpoint"))
 # Result choices: dropdown text and the label of the dialog's main button.
 OUTPUTS = {
     "selection": ("Selection", "_Select"),
@@ -89,8 +106,23 @@ OUTPUTS = {
     "mask": ("Mask on current layer", "_Add mask"),
     "channel": ("Channel", "_Save channel"),
     "slices": ("Slices: a layer per object", "_Slice"),
+    "remove": ("Remove the object", "_Remove"),
+}
+# The Result dropdown's tooltip: what the selected result does
+OUTPUT_TIPS = {
+    "selection": "Turns the result into GIMP's selection.",
+    "layer": "A copy of the current layer with the result as its layer mask: paint on the mask to "
+             "fix it later.",
+    "cutout": "A copy of the current layer with everything outside the object deleted.",
+    "mask": "The result as the current layer's mask.",
+    "channel": "The result as a new channel; GIMP's selection is left alone.",
+    "slices": "Cuts the current layer into a layer per object, plus one for the rest, in a new layer "
+              "group. A click inside a slice splits it.",
+    "remove": "Covers the object with made-up background, on a new layer. Works best where the "
+              "background is simple, such as a wall, a street or sky.",
 }
 MAX_SLICES = 255  # the backend numbers the slices in 8 bits (0 = the rest)
+REMOVING = " - removing the object..."  # in the status line until the Result view is ready
 OPERATIONS = {
     "replace": Gimp.ChannelOps.REPLACE, "add": Gimp.ChannelOps.ADD,
     "subtract": Gimp.ChannelOps.SUBTRACT, "intersect": Gimp.ChannelOps.INTERSECT,
@@ -311,6 +343,8 @@ SIDEBAR_CSS = b"""
 .aiselect-sidebar .heading { font-weight: bold; margin-top: 6px; }
 .aiselect-toolbar button { padding: 1px 6px; min-height: 0; }
 .aiselect-toolbar label { font-size: 9pt; }
+.aiselect-view:checked { background-image: none; background-color: #3b78c4; border-color: #2a5a96; }
+.aiselect-view:checked label { color: white; font-weight: bold; }
 .aiselect-busy { background-color: rgba(20, 20, 20, 0.75); border-radius: 10px; padding: 24px 32px; }
 .aiselect-busy label { color: white; font-size: 13pt; }
 .aiselect-busy spinner { color: white; }
@@ -326,7 +360,8 @@ class AISelectDialog(Gtk.Dialog):
     `zoom` is screen pixels per image pixel, as in GIMP."""
 
     def __init__(self, backend, image_load, image_size, preview_png, preview_size, options,
-                 soft_available=True, has_selection=True, guide_raw=None, models=()):
+                 soft_available=True, has_selection=True, guide_raw=None, models=(),
+                 remove_available=True):
         super().__init__(title="AI Fuzzy Select", modal=True)
         self.add_button("_Cancel", Gtk.ResponseType.CANCEL)
         self.select_button = self.add_button("_Select", Gtk.ResponseType.OK)
@@ -339,6 +374,9 @@ class AISelectDialog(Gtk.Dialog):
         self.preview_png = preview_png
         self.options = dict(options)
         self.soft_available = soft_available
+        self.remove_available = remove_available  # LaMa installed (older installs lack it)
+        if not remove_available and self.options["output"] == "remove":
+            self.options["output"] = "selection"
         self.has_selection = has_selection  # the image already has a selection to combine with
         if not soft_available:
             self.options["soft"] = False
@@ -356,6 +394,11 @@ class AISelectDialog(Gtk.Dialog):
         self.base_scaled = None  # base pre-scaled for the current zoom, when zoomed out
         self.overlay = None
         self.preview_count = 0
+        self.remove_timer = None  # shows the object removed, once the clicks are still
+        self.patch = None  # (surface, box): the background that removing the object puts in
+        self.patch_scaled = None  # patch pre-scaled for the current zoom, when zoomed out
+        self.patch_count = 0
+        self.remove_pending = False  # the object removed is being worked out (busy cursor)
         self.version = 0  # bumped on every change; older preview results are discarded
         self.soft_timer = None
         self.sharp_timer = None  # polls the backend while sharper outlines are worked out
@@ -601,16 +644,9 @@ class AISelectDialog(Gtk.Dialog):
         heading("Result")
         self.output = Gtk.ComboBoxText()
         for key, (text, _) in OUTPUTS.items():
-            self.output.append(key, text)
+            if key != "remove" or self.remove_available:
+                self.output.append(key, text)
         self.output.set_active_id(self.options["output"])
-        self.output.set_tooltip_text(
-            "What the button at the bottom right creates: a selection; a copy of the current "
-            "layer with the result as its layer mask (non-destructive: paint on the mask to fix "
-            "it later); a copy with everything outside the object deleted (a plain cut-out); "
-            "the result as the current layer's mask; a channel, leaving GIMP's selection alone; "
-            "or slices: the current layer cut into a layer per object plus one for the rest, in "
-            "a new layer group (the original is hidden). Each click makes a new slice, and a "
-            "click inside a slice splits it. Together the slices look exactly like the original.")
         self.output.connect("changed", lambda w: self.on_output_changed(w.get_active_id()))
         side.pack_start(self.output, False, False, 0)
 
@@ -636,6 +672,34 @@ class AISelectDialog(Gtk.Dialog):
         for child in self.existing_box.get_children():
             child.show()
         side.pack_start(self.existing_box, False, False, 0)
+
+        # Removing an object: how much of the image around it is used to make up the
+        # background (LaMa's crop: this % of the object's size on each side)
+        self.remove_box = Gtk.Box(spacing=6)
+        label = Gtk.Label(label="Surroundings", xalign=0)
+        self.remove_context = Gtk.Scale.new_with_range(Gtk.Orientation.HORIZONTAL, 0, 100, 5)
+        self.remove_context.set_digits(0)
+        self.remove_context.set_value(self.options["remove_context"])
+        self.remove_context.set_value_pos(Gtk.PositionType.RIGHT)
+        tip = ("How much of the image around the object is used to make up the background that "
+               "replaces it. Lower: made from what's right next to the object, often sharper. "
+               "Higher: uses more of the image, which can help for larger objects. View: Result "
+               "shows the effect.")
+        for widget in (label, self.remove_context):
+            widget.set_tooltip_text(tip)
+
+        def on_surroundings(scale):
+            value = int(round(scale.get_value()))
+            if value != self.options["remove_context"]:  # (dragging gives every fraction)
+                self.option_changed("remove_context", value, keep_patch=True)
+
+        self.remove_context.connect("value-changed", on_surroundings)
+        self.remove_box.pack_start(label, False, False, 0)
+        self.remove_box.pack_start(self.remove_context, True, True, 0)
+        self.remove_box.set_no_show_all(True)
+        for child in self.remove_box.get_children():
+            child.show()
+        side.pack_start(self.remove_box, False, False, 0)
 
         reset = Gtk.Button(label="Reset to defaults")
         reset.set_tooltip_text("Put all options back to their defaults (your clicks are kept). "
@@ -680,9 +744,18 @@ class AISelectDialog(Gtk.Dialog):
                                           "feathering show as grey (M toggles)")
         for button in (self.overlay_button, self.mask_button):
             button.set_mode(False)  # look like toggle buttons, not radio dots
+            button.get_style_context().add_class("aiselect-view")  # the one shown stands out
             button.set_focus_on_click(False)
             bar.pack_start(button, False, False, 0)
-        self.mask_button.connect("toggled", lambda b: self.render())
+        self.result_button = Gtk.RadioButton.new_with_label_from_widget(self.overlay_button, "Result")
+        self.result_button.set_tooltip_text("Removing an object: the photo with the object removed, as "
+                                            "the Remove button will make it (R toggles)")
+        self.result_button.set_mode(False)
+        self.result_button.get_style_context().add_class("aiselect-view")
+        self.result_button.set_focus_on_click(False)
+        bar.pack_start(self.result_button, False, False, 0)
+        self.mask_button.connect("toggled", lambda b: self.render(keep_patch=True))
+        self.result_button.connect("toggled", lambda b: (self.area.queue_draw(), self.update_cursor()))
         size = Gtk.Label(label=f"{self.image_size[0]} × {self.image_size[1]} px")
         size.set_opacity(0.7)
         bar.pack_end(size, False, False, 6)
@@ -706,6 +779,7 @@ class AISelectDialog(Gtk.Dialog):
         self.output.set_active_id(d["output"])
         if self.has_selection:
             self.operation.set_active_id(d["operation"])
+        self.remove_context.set_value(d["remove_context"])
         # (not the model: switching it analyses the image again)
         self.options.update({k: v for k, v in d.items() if k != "model"},
                             soft=d["soft"] and self.soft_available)
@@ -716,9 +790,11 @@ class AISelectDialog(Gtk.Dialog):
 
     def on_output_changed(self, output):
         was_slicing = self.slicing()
+        was_removing = self.options["output"] == "remove"
         self.options["output"] = output
         self.existing_box.set_visible(output == "selection" and self.has_selection)
         self.select_button.set_label(OUTPUTS[output][1])
+        self.output.set_tooltip_text(OUTPUT_TIPS[output])
         slicing = self.slicing()
         if slicing:
             first = ("<b>Click</b> an object: a new slice\n"
@@ -731,14 +807,20 @@ class AISelectDialog(Gtk.Dialog):
         self.help_label.set_markup(first + "<b>Ctrl+Z</b> undo\n"
                                    "<b>Ctrl+scroll</b> or <b>+ − 1</b> zoom\n"
                                    "<b>Middle-drag</b> or scroll to pan")
-        # Slices have hard edges (see render_options)
-        hard = "Off for slices: each pixel goes to exactly one slice, so they add up to the original"
-        self.feather.set_sensitive(not slicing)
-        self.feather.set_tooltip_text(hard if slicing else self.feather_tip)
-        self.soft.set_sensitive(self.soft_available and not slicing)
+        hard = HARD_EDGES.get(output)
+        self.feather.set_sensitive(not hard)
+        self.feather.set_tooltip_text(hard or self.feather_tip)
+        self.soft.set_sensitive(self.soft_available and not hard)
         if self.soft_available:
-            self.soft.set_tooltip_text(hard if slicing else self.soft_tip)
-        if slicing != was_slicing and self.objects:
+            self.soft.set_tooltip_text(hard or self.soft_tip)
+        removing = output == "remove"
+        self.remove_box.set_visible(removing)
+        self.result_button.set_sensitive(removing)
+        if removing:
+            self.result_button.set_active(True)
+        elif self.result_button.get_active():
+            self.overlay_button.set_active(True)
+        if (slicing != was_slicing or removing or was_removing) and self.objects:
             self.render()
 
     def set_busy(self, message, error=False):
@@ -804,7 +886,7 @@ class AISelectDialog(Gtk.Dialog):
         ix = (hadj.get_value() + anchor[0] - ox) / self.zoom
         iy = (vadj.get_value() + anchor[1] - oy) / self.zoom
         self.zoom = min(max(zoom, ZOOM_STEPS[0]), ZOOM_STEPS[-1])
-        self.base_scaled = None
+        self.base_scaled = self.patch_scaled = None
         w, h = self.image_size
         self.area.set_size_request(max(1, int(w * self.zoom)), max(1, int(h * self.zoom)))
         self.zoom_label.set_text(f"{self.zoom * 100:.0f}%")
@@ -864,7 +946,20 @@ class AISelectDialog(Gtk.Dialog):
             cr.set_source_rgba(0, 0, 0, 0.45)
             cr.fill()
             cr.restore()
-        if self.overlay is not None:
+        if self.patch is not None and self.result_button.get_active():
+            surface, (x1, y1, _, _) = self.patch  # the object removed, at full resolution
+            cr.save()
+            if self.zoom < 1:  # pre-scaled once per zoom level, like the image
+                if self.patch_scaled is None:
+                    self.patch_scaled = scaled_surface(surface, self.zoom, cairo.FORMAT_ARGB32)
+                cr.set_source_surface(self.patch_scaled, x1 * self.zoom, y1 * self.zoom)
+            else:
+                cr.scale(self.zoom, self.zoom)
+                cr.set_source_surface(surface, x1, y1)
+                cr.get_source().set_filter(cairo.FILTER_NEAREST)
+            cr.paint()
+            cr.restore()
+        elif self.overlay is not None:
             cr.save()
             s = self.zoom * self.image_size[0] / self.preview_size[0]
             cr.scale(s, s)
@@ -884,24 +979,26 @@ class AISelectDialog(Gtk.Dialog):
                 cr.set_dash(dash)
                 cr.stroke()
             cr.set_dash([])
-        # Boxes and click markers: green = include, red = exclude.
+        # Boxes and click markers: green = include, red = exclude. Faint in the Result view,
+        # so they don't hide the object removed.
+        a = 0.3 if self.result_button.get_active() else 1.0
         for obj in self.objects:
             if obj.get("box"):
                 x1, y1, x2, y2 = (v * self.zoom for v in obj["box"])
                 colour = (0.1, 0.75, 0.2) if obj["sign"] > 0 else (0.9, 0.15, 0.15)
                 for rgb, width in (((1, 1, 1), 3), (colour, 1.5)):
                     cr.rectangle(x1, y1, x2 - x1, y2 - y1)
-                    cr.set_source_rgb(*rgb)
+                    cr.set_source_rgba(*rgb, a)
                     cr.set_line_width(width)
                     cr.stroke()
             for x, y, label in obj.get("points", []):
                 include = label == 1 and obj["sign"] > 0
                 px, py = (x + 0.5) * self.zoom, (y + 0.5) * self.zoom
                 cr.arc(px, py, 6, 0, 6.2832)
-                cr.set_source_rgb(1, 1, 1)
+                cr.set_source_rgba(1, 1, 1, a)
                 cr.fill()
                 cr.arc(px, py, 4, 0, 6.2832)
-                cr.set_source_rgb(0.1, 0.75, 0.2) if include else cr.set_source_rgb(0.9, 0.15, 0.15)
+                cr.set_source_rgba(*((0.1, 0.75, 0.2) if include else (0.9, 0.15, 0.15)), a)
                 cr.fill()
         ctrl_with_nothing = self.modifiers & Gdk.ModifierType.CONTROL_MASK and not self.objects
         if self.hover_polygons and not self.drag and self.pan_start is None and not ctrl_with_nothing:
@@ -1083,7 +1180,8 @@ class AISelectDialog(Gtk.Dialog):
 
     def update_cursor(self, state=None):
         """Fuzzy-Select-style cursor over the image: '+' with Shift, '-' with Ctrl; the
-        busy cursor while analysing and a move cursor while panning."""
+        busy cursor while analysing, a move cursor while panning, and the busy-but-clickable
+        cursor while the Result view waits for the object removed."""
         if state is not None:
             self.modifiers = state & (Gdk.ModifierType.SHIFT_MASK | Gdk.ModifierType.CONTROL_MASK)
         window = self.area.get_window()
@@ -1093,6 +1191,8 @@ class AISelectDialog(Gtk.Dialog):
             key = "wait"
         elif self.pan_start is not None:
             key = "move"
+        elif self.remove_pending and self.result_button.get_active():
+            key = "progress"
         elif self.modifiers & Gdk.ModifierType.CONTROL_MASK:
             key = "-"
         elif self.modifiers & Gdk.ModifierType.SHIFT_MASK:
@@ -1101,7 +1201,7 @@ class AISelectDialog(Gtk.Dialog):
             key = None
         if key not in self.cursors:
             display = window.get_display()
-            if key in ("wait", "move"):
+            if key in ("wait", "move", "progress"):
                 self.cursors[key] = Gdk.Cursor.new_from_name(display, key)
             else:
                 self.cursors[key] = make_tool_cursor(display, key)
@@ -1144,15 +1244,18 @@ class AISelectDialog(Gtk.Dialog):
             # A radio button can't be switched off directly: switch the other one on.
             other = self.overlay_button if self.mask_button.get_active() else self.mask_button
             other.set_active(True)
+        elif key in (Gdk.KEY_r, Gdk.KEY_R) and self.result_button.get_sensitive():
+            other = self.overlay_button if self.result_button.get_active() else self.result_button
+            other.set_active(True)
         else:
             return False
         return True
 
 
-    def option_changed(self, key, value):
+    def option_changed(self, key, value, keep_patch=False):
         self.options[key] = value
         if self.objects:
-            self.render()
+            self.render(keep_patch)
         if key in ("granularity", "threshold") and self.hover_target:
             self.hover_polygons = None
             self.hover_at(self.hover_target)
@@ -1211,17 +1314,24 @@ class AISelectDialog(Gtk.Dialog):
         req["view"] = "mask" if self.mask_button.get_active() else "overlay"
         return req
 
-    def render(self):
+    def render(self, keep_patch=False):
         """Fast preview right away; with Soft edges on, a soft-edge preview follows once
-        the clicks and options have been still for a moment. Sharper outlines are worked
-        out in the background: the preview shows the normal outline until they are ready
-        (see poll_sharp)."""
+        the clicks and options have been still for a moment, and so does the object removed
+        (see request_remove_preview). Sharper outlines are worked out in the background: the
+        preview shows the normal outline until they are ready (see poll_sharp).
+        keep_patch: keep showing the object removed until the new result is there (an
+        option changed, not the clicks)."""
         self.area.queue_draw()  # show the new click marker right away
         self.select_button.set_sensitive(bool(self.objects))
         self.version += 1
-        if self.soft_timer:
-            GLib.source_remove(self.soft_timer)
-            self.soft_timer = None
+        if not keep_patch:
+            self.patch = None
+        self.remove_pending = bool(self.objects) and self.options["output"] == "remove"
+        self.update_cursor()
+        for timer in ("soft_timer", "remove_timer"):
+            if getattr(self, timer):
+                GLib.source_remove(getattr(self, timer))
+                setattr(self, timer, None)
         if self.sharp_timer:
             GLib.source_remove(self.sharp_timer)
             self.sharp_timer = None
@@ -1234,9 +1344,46 @@ class AISelectDialog(Gtk.Dialog):
                              lambda reply: self.on_rendered(reply, version), coalesce="preview")
         if self.soft_on():
             self.soft_timer = GLib.timeout_add(500, self.request_soft_preview, version)
+        if self.options["output"] == "remove":
+            self.remove_timer = GLib.timeout_add(400, self.request_remove_preview, version)
+
+    def request_remove_preview(self, version):
+        """The object removed, as the Remove button will make it (a final render with the same
+        selection and area reuses it), at full resolution: shown in the Result view."""
+        self.remove_timer = None
+        if version != self.version:
+            return False
+        self.patch_count += 1
+        req = self.render_request()
+        req["remove_preview"] = f"{os.path.splitext(self.preview_png)[0]}_patch_{self.patch_count}.png"
+        self.backend.request(req, lambda reply: self.on_removed(reply, version), coalesce="remove")
+        return False
+
+    def on_removed(self, reply, version):
+        path = reply.get("patch")
+        if version == self.version or not reply["ok"]:  # (else a newer one is on its way)
+            self.remove_pending = False
+            self.update_cursor()
+        if not reply["ok"]:
+            self.set_status("Error: " + reply["error"])
+        elif version == self.version and reply.get("patch_box"):
+            self.patch = (surface_from_pixbuf(GdkPixbuf.Pixbuf.new_from_file(path)), reply["patch_box"])
+            self.patch_scaled = None
+            self.set_status(self.status.get_text().replace(REMOVING, "")
+                            + f" - object removed ({reply['seconds']:.1f} s)"
+                            + ("" if self.result_button.get_active() else "; View: Result shows it"))
+            self.area.queue_draw()
+        elif version == self.version:  # nothing left to remove (e.g. shrunk to nothing)
+            self.set_status(self.status.get_text().replace(REMOVING, " - nothing to remove"))
+        if path:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+        return False
 
     def soft_on(self):
-        return self.options["soft"] and self.soft_available and not self.slicing()
+        return self.options["soft"] and self.soft_available and self.options["output"] not in HARD_EDGES
 
     def poll_sharp(self, version):
         """While sharper outlines are worked out in the background, ask every 300 ms
@@ -1255,6 +1402,8 @@ class AISelectDialog(Gtk.Dialog):
             else:
                 self.backend.request(self.preview_request(soft=False),
                                      lambda r: self.on_rendered(r, version), coalesce="preview")
+                if self.options["output"] == "remove":  # again, with the sharper outline
+                    self.request_remove_preview(version)
             return False
 
         self.backend.request({"cmd": "sharp_status"}, on_status, coalesce="sharp_status")
@@ -1363,9 +1512,10 @@ class AISelectDialog(Gtk.Dialog):
                 refining.append("sharper outlines")
                 if not self.sharp_timer:
                     self.sharp_timer = GLib.timeout_add(300, self.poll_sharp, version)
-                if self.soft_timer:  # soft edges would be worked out on the outline about to
-                    GLib.source_remove(self.soft_timer)  # change; poll_sharp asks for them later
-                    self.soft_timer = None
+                for timer in ("soft_timer", "remove_timer"):  # soft edges and the object removed
+                    if getattr(self, timer):  # would be worked out on the outline about to
+                        GLib.source_remove(getattr(self, timer))  # change; poll_sharp asks later
+                        setattr(self, timer, None)
             elif reply.get("sharp_refined"):
                 shown.append("sharper outlines")
             else:
@@ -1383,6 +1533,8 @@ class AISelectDialog(Gtk.Dialog):
             status += f" - refining {' and '.join(refining)}..."
         elif soft and not self.mask_button.get_active():
             status += " - switch the view to Mask to see the soft edges"
+        if self.options["output"] == "remove" and self.patch is None:
+            status += REMOVING
         self.set_status(status)
         self.area.queue_draw()
         return False
@@ -1474,9 +1626,9 @@ def surface_from_pixbuf(pixbuf):
     return surface
 
 
-def scaled_surface(surface, scale):
+def scaled_surface(surface, scale, fmt=cairo.FORMAT_RGB24):
     w, h = max(1, int(surface.get_width() * scale)), max(1, int(surface.get_height() * scale))
-    out = cairo.ImageSurface(cairo.FORMAT_RGB24, w, h)
+    out = cairo.ImageSurface(fmt, w, h)
     cr = cairo.Context(out)
     cr.scale(scale, scale)
     cr.set_source_surface(surface, 0, 0)
@@ -1673,6 +1825,32 @@ def cut_slice(image, piece, data, number, box=None):
     return True
 
 
+def apply_patch(image, patch_file, box, layer):
+    """Removing an object: a new layer right above `layer` (or at the top) with the
+    background LaMa made up for it (see remove_patch in aiselect_server.py), cropped to
+    the patch and transparent around it."""
+    x1, y1, x2, y2 = box
+    with open(patch_file, "rb") as f:
+        data = f.read()
+    gray = image.get_base_type() == Gimp.ImageBaseType.GRAY
+    name = f"{layer.get_name()} (object removed)" if layer is not None else "Object removed"
+    patch = Gimp.Layer.new(image, name, x2 - x1, y2 - y1,
+                           Gimp.ImageType.GRAYA_IMAGE if gray else Gimp.ImageType.RGBA_IMAGE,
+                           100, Gimp.LayerMode.NORMAL)
+    if layer is not None:
+        image.insert_layer(patch, layer.get_parent(), image.get_item_position(layer))
+    else:
+        image.insert_layer(patch, None, 0)
+    patch.set_offsets(x1, y1)
+    # The backend's pixels are in the image's colour space, as export_visible gave them
+    fmt = Babl.get_name(Babl.format_with_space("R'G'B'A u8", patch.get_format()))
+    buffer = patch.get_buffer()
+    buffer.set(Gegl.Rectangle.new(0, 0, x2 - x1, y2 - y1), fmt, data)
+    buffer.flush()
+    patch.update(0, 0, x2 - x1, y2 - y1)
+    image.set_selected_layers([patch])
+
+
 def apply_result(image, raw_file, output, operation, layer):
     """Create what the user chose under Result. `layer` is the layer that was selected
     when the plugin started (for "layer" and "mask"). Returns an error message or None."""
@@ -1789,6 +1967,7 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
     # open it, as for a normal run.
     interactive = run_mode != Gimp.RunMode.NONINTERACTIVE
     options = dict(DEFAULT_OPTIONS, **load_json(OPTIONS_FILE, {}))
+    options["remove_context"] = min(100, options["remove_context"])  # (it went to 300 before)
     models = list(settings.get("models", {}))  # installed SAM2 models, the default first
     if settings.get("model") in models:
         models.insert(0, models.pop(models.index(settings["model"])))
@@ -1803,6 +1982,7 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
                     "model"):
             options[key] = config.get_property(key)
         options["fill_holes"] = config.get_property("fill-holes")
+        options["remove_context"] = config.get_property("remove-context")
         options["model"] = options["model"] or ""  # GIMP gives None for an unset string
         for key, allowed in (("granularity", GRANULARITIES), ("operation", tuple(OPERATIONS)),
                              ("output", tuple(OUTPUTS)), ("model", ("",) + tuple(models))):
@@ -1837,7 +2017,8 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
                 export_selection(image, guide_raw)
             dialog = AISelectDialog(backend, image_load, size, preview_png, psize, options,
                                     soft_available=soft_edges_available(settings),
-                                    has_selection=has_selection, guide_raw=guide_raw, models=models)
+                                    has_selection=has_selection, guide_raw=guide_raw, models=models,
+                                    remove_available=remove_available(settings))
             response = dialog.run()
             objects, options = dialog.objects, dialog.options
             dialog.destroy()
@@ -1865,6 +2046,12 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
             return f"Unknown result type {output!r}."
         out = os.path.join(work, "selection.raw")
         req = dict(render_options(options), cmd="render", objects=objects, final=True, out=out)
+        if output == "remove":
+            if not remove_available(settings):
+                return ("Removing objects isn't installed yet: run the installer again "
+                        "(install.bat, or sh install.sh) to add it.")
+            Gimp.progress_set_text("AI Fuzzy Select: filling in the background...")
+            req["patch_out"] = os.path.join(work, "patch.raw")
         reply = backend.call(req)
         log(f"final render reply={json.dumps(reply)} out_size="
             f"{os.path.getsize(out) if os.path.exists(out) else 'missing'}")
@@ -1877,6 +2064,8 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
             operation = options["operation"] if has_selection or not interactive else "replace"
             if output == "slices":
                 error = apply_slices(image, out, reply["slices"], layer)
+            elif output == "remove":
+                error = apply_patch(image, req["patch_out"], reply["patch_box"], layer)
             else:
                 error = apply_result(image, out, output, operation, layer)
         finally:
@@ -1929,9 +2118,12 @@ class AISelect(Gimp.PlugIn):
         procedure.add_boolean_argument("sharp", "Sharper outlines", "Look at each object again on a crop around it",
                                        False, rw)
         procedure.add_boolean_argument("soft", "Soft edges", "ViTMatte soft edges", False, rw)
+        procedure.add_int_argument("remove-context", "Surroundings",
+                                   "Removing an object: how much of the image around it is used to make up the "
+                                   "background (% of its size on each side)", 0, 100, 20, rw)
         procedure.add_string_argument("operation", "Operation", "replace, add, subtract or intersect",
                                       "replace", rw)
-        procedure.add_string_argument("output", "Result", "selection, layer, cutout, mask, channel or slices",
+        procedure.add_string_argument("output", "Result", "selection, layer, cutout, mask, channel, slices or remove",
                                       "selection", rw)
         return procedure
 

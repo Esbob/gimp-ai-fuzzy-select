@@ -29,6 +29,7 @@ Only the Python standard library is needed to run this script.
 
 import argparse
 import contextlib
+import hashlib
 import json
 import locale
 import os
@@ -68,6 +69,9 @@ SUPPORTED_PYTHONS = ("3.10", "3.11", "3.12", "3.13", "3.14")
 # is detectron2's LazyConfig.
 MATTE_ANYTHING = ("hustvl/Matte-Anything", "874951ac0b8d324ad9f885baf1c7de711b8dc1b0")
 DETECTRON2 = ("facebookresearch/detectron2", "1e3e13bbf607b54f62205c4c33922521822fb298")
+# LaMa (Apache 2.0) as TorchScript, the file IOPaint (lama-cleaner) uses; for removing objects
+LAMA_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
+LAMA_SHA256 = "344c77bbcb158f17dd143070d1e789f38a66c04202311ae3a258ef66667a9ea9"
 VITMATTE_GDRIVE_ID = "1d97oKuITCeWgai2Tf3iNilt6rMSSYzkW"  # ViTMatte_B_DIS.pth (Matte Anything's README)
 
 TORCH_INDEX = "https://download.pytorch.org/whl/{}"
@@ -459,6 +463,22 @@ def get_sam2_checkpoint(name, dest_dir, existing):
     return dest
 
 
+def get_lama_checkpoint(dest):
+    if dest.exists():
+        ok(f"Already present: {dest}")
+        return dest
+    info("Downloading big-lama.pt (~206 MB)")
+    download(LAMA_URL, dest)
+    digest = hashlib.sha256()
+    with open(dest, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            digest.update(chunk)
+    if digest.hexdigest() != LAMA_SHA256:
+        dest.unlink()
+        raise InstallError(f"The download of {LAMA_URL} isn't the expected file (SHA-256 {digest.hexdigest()})")
+    return dest
+
+
 def get_vitmatte_checkpoint(py, dest, existing):
     if existing:
         existing = Path(existing).resolve()
@@ -638,6 +658,44 @@ res["sharp_refined_after"] = call(cmd="render", objects=box, sharp=True,
                                   preview_out=os.path.join(work, "p4.png"))["sharp_refined"]
 f = final(click, feather=10)
 res["feather_soft_px"] = int(((f > 0.02) & (f < 0.98)).sum())
+# Removing the disc: the patch covers it, and inside the disc it looks like the sky gradient
+# behind it (known here), not like the disc. (Measured between the strands, which LaMa
+# rightly continues through the middle.)
+if json.loads(settings).get("lamaCheckpoint"):
+    t0 = time.time()
+    r = call(cmd="render", objects=click, final=True, out=out, patch_out=os.path.join(work, "patch.raw"))
+    res["remove_s"] = round(time.time() - t0, 1)
+    x1, y1, x2, y2 = r["patch_box"]
+    patch = np.fromfile(os.path.join(work, "patch.raw"), np.uint8).reshape(y2 - y1, x2 - x1, 4)
+    covered = np.zeros(true.shape, bool)
+    covered[y1:y2, x1:x2] = patch[..., 3] == 255
+    yy = np.mgrid[0:true.shape[0], 0:true.shape[1]][0]
+    sky = np.dstack([110 + 0.1 * yy, 170 + 0.05 * yy, 235 + 0 * yy])
+    photo = cv2.cvtColor(cv2.imread(os.path.join(work, "input.png")), cv2.COLOR_BGR2RGB).astype(float)
+    strands = np.zeros(true.shape, np.uint8)
+    for ang in np.linspace(0, 2 * np.pi, 20, endpoint=False):
+        cv2.line(strands, (400, 300), (int(400 + 260 * np.cos(ang)), int(300 + 260 * np.sin(ang))), 1, 15)
+    inside = (hard > 0.5) & (strands == 0)
+    filled = photo.copy()
+    filled[y1:y2, x1:x2][patch[..., 3] == 255] = patch[..., :3][patch[..., 3] == 255]
+    res["remove"] = [bool((covered >= (hard > 0.5)).all()), round(float(np.abs(photo - sky)[inside].mean()), 1),
+                     round(float(np.abs(filled - sky)[inside].mean()), 1)]
+    # The window shows the result first (a PNG); pressing Remove then reuses it, unless the
+    # area around the object changed
+    def removal(**kw):
+        t0 = time.time()
+        r = call(cmd="render", objects=click, out=out, **kw)
+        return r, time.time() - t0
+    shown, t_shown = removal(remove_preview=os.path.join(work, "shown.png"), remove_context=60)
+    final_r, t_final = removal(final=True, patch_out=os.path.join(work, "patch2.raw"), remove_context=60)
+    x1, y1, x2, y2 = final_r["patch_box"]
+    final_patch = np.fromfile(os.path.join(work, "patch2.raw"), np.uint8).reshape(y2 - y1, x2 - x1, 4)
+    shown_patch = cv2.cvtColor(cv2.imread(os.path.join(work, "shown.png"), cv2.IMREAD_UNCHANGED), cv2.COLOR_BGRA2RGBA)
+    other, t_other = removal(final=True, patch_out=os.path.join(work, "patch3.raw"), remove_context=10)
+    other_patch = np.fromfile(os.path.join(work, "patch3.raw"), np.uint8)
+    res["remove_shown"] = [shown["patch_box"] == final_r["patch_box"] and bool((shown_patch == final_patch).all()),
+                           round(t_shown, 2), round(t_final, 2),
+                           other_patch.size != final_patch.size or bool((other_patch != final_patch.ravel()).any())]
 if soft:
     t0 = time.time()
     s = final(click, soft=True)
@@ -719,6 +777,19 @@ try:
                                                      Gegl.AbyssPolicy.NONE))[3]
     report["cutout_result"] = (len(img.get_layers()) == 3 and cut.get_mask() is None
                                and alpha(400, 300) == 255 and alpha(5, 5) == 0)
+    # Removing the object: a layer right above with the sky filled in where the disc was
+    if args["remove"]:
+        made = ai_select("replace", "remove")
+        top = img.get_layers()[0]
+        px = lambda layer, x, y: list(bytes(layer.get_buffer().get(Gegl.Rectangle.new(x, y, 1, 1), 1.0,
+                                                                    "R'G'B'A u8", Gegl.AbyssPolicy.NONE)))
+        _, ox, oy = top.get_offsets()
+        centre = px(top, 479 - ox, 313 - oy)  # inside the disc, between two strands
+        checks = {"ran": made, "named": top.get_name().endswith("(object removed)"),
+                  "cropped": top.get_width() < 400 and 240 <= ox <= 260,
+                  "sky where the disc was": centre[3] == 255 and centre[2] > 200 and centre[0] < 170}
+        report["remove_result"] = all(checks.values()) or str(dict(checks, error=last_error[0], centre=centre))
+        img.remove_layer(top)
     ai_select("replace", "channel")
     ours = [c for c in img.get_channels() if c.get_name().startswith("AI Fuzzy Select")]
     report["channel_result"] = (len(ours) == 1 and value(ours[0], 400, 300) == 255
@@ -888,6 +959,26 @@ try:
     res["slice_status"] = click(20, 500, Gdk.ModifierType.CONTROL_MASK, (60, 560))  # some sky
     res["slice_numbers"] = [o.get("slice") for o in dlg.objects]
     res["slice_hard_edges"] = not dlg.feather.get_sensitive() and not dlg.soft.get_sensitive()
+    if settings.get("lamaCheckpoint"):  # removing an object: also hard edges
+        dlg.output.set_active_id("remove")
+        res["remove_hard_edges"] = (dlg.output.get_active_id() == "remove" and not dlg.feather.get_sensitive()
+                                    and not dlg.soft.get_sensitive() and dlg.select_button.get_label() == "_Remove")
+        # the object removed is shown in the Result view, which comes on by itself
+        dlg.clear()
+        cursor = lambda: dlg.area.get_window().get_cursor()
+        click(400, 300)
+        waiting = cursor() is not None and cursor() is dlg.cursors.get("progress")  # until it's shown
+        shown = pump(lambda: dlg.patch is not None, 120)
+        res["remove_shown"] = [shown, dlg.result_button.get_active(), dlg.remove_box.get_visible(),
+                               "object removed" in dlg.status.get_text(), waiting,
+                               cursor() is not dlg.cursors.get("progress")]
+        # the Mask view and back keeps the object removed; another result stops its removal
+        dlg.mask_button.set_active(True)
+        kept = dlg.patch is not None
+        dlg.result_button.set_active(True)
+        dlg.output.set_active_id("selection")
+        res["remove_switch"] = [kept, not dlg.remove_pending, dlg.remove_timer is None]
+        dlg.output.set_active_id("remove")
 except Exception:
     import traceback
     res["exception"] = traceback.format_exc()
@@ -936,6 +1027,13 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
          f"hover meanwhile {r['sharp_hover_ms']} ms while the refinement took {r['sharp_refine_ms']} ms, "
          f"then shown: {r['sharp_refined_after'] == 1})"),
         (r["feather_soft_px"] > 1000, f"feather softens the edge ({r['feather_soft_px']} partial pixels)"),
+        *([(r["remove"][0] and r["remove"][2] < 20 < r["remove"][1],
+             f"removing the object fills it with the background (covered: {r['remove'][0]}; error vs the true "
+             f"background {r['remove'][1]} -> {r['remove'][2]}; {r['remove_s']} s incl. loading LaMa)"),
+           (r["remove_shown"][0] and r["remove_shown"][3] and r["remove_shown"][2] < r["remove_shown"][1],
+            f"the result shown in the window is what Remove makes, reused ({r['remove_shown'][1]} s to show, "
+            f"{r['remove_shown'][2]} s on Remove; another area makes a new one: {r['remove_shown'][3]})")]
+          if "remove" in r else []),
     ]
     if "fallback_small" in r:
         checks.append((r["fallback_small"] == ["small", "cuda", True] and r["fallback_cpu"] == ["small", "cpu", True],
@@ -956,9 +1054,9 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
     return passed
 
 
-def run_gimp_test(py, gimp_console, work):
+def run_gimp_test(py, gimp_console, work, remove):
     args = {"input": str(Path(work, "input.png")), "mask_out": str(Path(work, "gimp_mask.raw")),
-            "report": str(Path(work, "gimp_report.json"))}
+            "report": str(Path(work, "gimp_report.json")), "remove": remove}
     script = Path(work, "gimp_test.py")
     script.write_text(GIMP_TEST.replace("ARGS", repr(args)), encoding="utf-8")
     t0 = time.time()
@@ -980,14 +1078,16 @@ def run_gimp_test(py, gimp_console, work):
     mae = float(run([py, "-c", score, Path(work, "alpha_true.npy"), args["mask_out"]], capture=True))
     passed = (mae < 0.03 and report.get("add_keeps_old") and report.get("add_has_disc")
               and bool(report.get("layer_still_selected")) and report.get("layer_result")
-              and report.get("cutout_result") and report.get("channel_result"))
+              and report.get("cutout_result") and report.get("channel_result")
+              and (not remove or report.get("remove_result") is True))
     (ok if passed else fail)(
         f"in GIMP: a click gave a selection with error {mae:.4f}; the layer stayed selected: "
         f"{bool(report.get('layer_still_selected'))}; 'add' kept the old selection: "
         f"{report.get('add_keeps_old')} and added the object: {report.get('add_has_disc')}; "
         f"new layer with mask: {report.get('layer_result')}; cut-out: {report.get('cutout_result')}; "
-        f"channel: {report.get('channel_result')} "
-        f"({time.time() - t0:.0f} s incl. GIMP start)")
+        f"channel: {report.get('channel_result')}"
+        + (f"; remove the object: {report.get('remove_result')}" if remove else "")
+        + f" ({time.time() - t0:.0f} s incl. GIMP start)")
     unusual = {"slices": "slices", "locked layer": "locked_layer", "the script's drawable": "drawable_used",
                "group cut-out": "group_cutout", "a wrong option refused": "bad_option",
                "nothing visible": "all_hidden"}
@@ -1016,13 +1116,19 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
               and "selected" in r["click"] and r["objects"] == [1, 1, -1] and bool(r["box_object"]) and "1 box" in r["box_drag"] and r["shift_cursor"]
               and r["select_enabled"] and (switch is None or (switch[1] and "selected" in switch[2]))
               and r["slice_numbers"] == [1, 2, 2, None] and "2 slices" in r["slice_status"]
-              and r["slice_hard_edges"])
+              and r["slice_hard_edges"] and r.get("remove_hard_edges", True)
+              and all(r.get("remove_shown", [True])) and all(r.get("remove_switch", [True])))
     (ok if passed else fail)(
         f"window: options disabled while loading {r['sidebar_disabled_while_loading']}, ready "
         f"{r['ready']}; click/Shift/Ctrl gave objects {r['objects']}; a drag made box {r['box_object']}; '+' cursor with Shift "
         f"{r['shift_cursor']}; status: {r['ctrl_click']!r}"
         + (f"; switched to model {switch[0]}, clicks kept {switch[1]}: {switch[2]!r}" if switch else "")
-        + f"; slices {r['slice_numbers']}, soft edges and feather off {r['slice_hard_edges']}: {r['slice_status']!r}")
+        + f"; slices {r['slice_numbers']}, soft edges and feather off {r['slice_hard_edges']}: {r['slice_status']!r}"
+        + (f"; remove the object offered, with soft edges and feather off: {r['remove_hard_edges']}; "
+           f"the object removed shown, in the Result view, with the area option, said in the status, busy "
+           f"cursor while waiting, and not after: "
+           f"{r['remove_shown']}; kept through the Mask view, stopped for another result: "
+           f"{r['remove_switch']}" if "remove_hard_edges" in r else ""))
     return bool(passed)
 
 
@@ -1044,7 +1150,7 @@ def run_tests(py, settings, plugin_dir, soft, expect_cuda, gimp_console):
         run([py, "-c", SYNTHETIC_IMAGE, work], capture=True)
         passed = run_backend_test(py, work, plugin_dir, settings, soft)
         if gimp_console:
-            passed = run_gimp_test(py, gimp_console, work) and passed
+            passed = run_gimp_test(py, gimp_console, work, bool(settings.get("lamaCheckpoint"))) and passed
             passed = run_window_test(gimp_console, plugin_dir, settings, work) and passed
         else:
             info("GIMP tests skipped: gimp-console not found")
@@ -1152,6 +1258,12 @@ def main():
                 settings = {"pythonPath": str(py), "model": models[0],
                             "models": {m: {"config": MODELS[m][0], "checkpoint": str(path)}
                                        for m, path in installed.items()}}
+                step("Fetching LaMa for removing objects")
+                try:
+                    settings["lamaCheckpoint"] = str(get_lama_checkpoint(checkpoints / "big-lama.pt"))
+                except (InstallError, OSError) as e:  # (optional: everything else still works)
+                    print(f"\nWARNING: LaMa could not be downloaded ({e}). Everything else is installed; "
+                          "only \"Remove the object\" is missing. Run the installer again later to add it.")
                 if soft:
                     step("Installing ViTMatte for soft edges")
                     vitmatte_dir = install_soft_edges(py, src)
