@@ -181,7 +181,8 @@ installer and uninstaller stop a running backend before changing its files.
 - **GIMP 3** with Python plug-in support (included in the official Windows installer).
   Tested with GIMP 3.2.6.
 - **Python 3.10–3.14, 64-bit**, to run the installer (not 3.15: PyTorch crashes on it). On Windows,
-  `install.bat` offers to install Python 3.14 for you if you don't have it. The plug-in's backend runs in a
+  `install.bat` offers to install Python 3.14 for you if you don't have it, and on Linux
+  `install.sh` offers to download one just for AI Fuzzy Select. The plug-in's backend runs in a
   virtual environment the installer creates with this Python; GIMP's own Python is not
   used for the models.
 - **An NVIDIA GPU is strongly recommended.** Tested on a GeForce GTX 1050 Ti (2018) with 4 GB of
@@ -227,8 +228,12 @@ tests. The unzipped folder isn't needed afterwards, except for uninstalling.
 
 On Linux and macOS (macOS untested): download and unzip the same zip, then run `sh install.sh` in
 that folder in a terminal; on macOS you can instead double-click `install.command` (the first
-time, right-click it and choose Open). On Ubuntu and Debian, install GIMP and Python's venv
-package from apt first: `sudo apt install gimp python3-venv` (tested on Ubuntu 26.04).
+time, right-click it and choose Open). Install GIMP 3 first (on Ubuntu and Debian:
+`sudo apt install gimp`; tested on Ubuntu 26.04). On Linux, if there's no Python 3.10–3.14
+that can create virtual environments, `install.sh` offers to download Python 3.14 for AI Fuzzy
+Select: with [uv](https://github.com/astral-sh/uv) (its download checked against its SHA-256),
+about 50 MB, into the install folder, without sudo; the uninstaller removes it again. You can
+instead install Python's venv package yourself, e.g. `sudo apt install python3-venv`.
 
 With git: `git clone https://github.com/Esbob/gimp-ai-fuzzy-select`, then the same as above
 in that folder, or run `python install_ai_select.py` directly.
