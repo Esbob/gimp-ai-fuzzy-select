@@ -291,6 +291,15 @@ def find_gimp_console():
     return next((c for c in candidates if c.exists()), None)
 
 
+def is_store_python(executable=sys.executable, base_prefix=sys.base_prefix):
+    """The Microsoft Store's Python: Windows redirects the files it creates under AppData to a
+    private folder (AppData/Local/Packages/PythonSoftwareFoundation.Python.../LocalCache),
+    so the virtual environment it made there failed to start ("failed to locate pyvenv.cfg"),
+    and the plug-in it copied would be where GIMP never looks."""
+    return IS_WINDOWS and any("WindowsApps" in p or "PythonSoftwareFoundation.Python" in p
+                              for p in (executable, base_prefix))
+
+
 def venv_python(venv_dir):
     return Path(venv_dir) / ("Scripts/python.exe" if IS_WINDOWS else "bin/python")
 
@@ -1189,6 +1198,12 @@ def main():
                    "e.g.  py -3.14 install_ai_select.py")
     if platform.architecture()[0] != "64bit":
         sys.exit("A 64-bit Python is required for PyTorch.")
+    if is_store_python():
+        sys.exit("This is the Microsoft Store version of Python, which can't install AI Fuzzy Select: "
+                 "Windows keeps the files it creates under AppData in a private folder, where GIMP "
+                 "doesn't see them.\nInstall Python 3.14 from https://www.python.org/downloads/ "
+                 "(install.bat finds it by itself) and run the installer again. The Store Python can "
+                 "stay installed.")
 
     install_dir = args.install_dir.resolve()
     if IS_WINDOWS and len(str(install_dir)) > 60:

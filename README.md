@@ -180,7 +180,8 @@ installer and uninstaller stop a running backend before changing its files.
 
 - **GIMP 3** with Python plug-in support (included in the official Windows installer).
   Tested with GIMP 3.2.6.
-- **Python 3.10–3.14, 64-bit**, to run the installer (not 3.15: PyTorch crashes on it). The plug-in's backend runs in a
+- **Python 3.10–3.14, 64-bit**, to run the installer (not 3.15: PyTorch crashes on it). On Windows,
+  `install.bat` offers to install Python 3.14 for you if you don't have it. The plug-in's backend runs in a
   virtual environment the installer creates with this Python; GIMP's own Python is not
   used for the models.
 - **An NVIDIA GPU is strongly recommended.** Tested on a GeForce GTX 1050 Ti (2018) with 4 GB of
@@ -203,15 +204,21 @@ installer and uninstaller stop a running backend before changing its files.
 On Windows:
 
 1. **Install GIMP 3** from [gimp.org](https://www.gimp.org/downloads/), start it once and close it.
-2. **Install Python 3.14** from [python.org](https://www.python.org/downloads/release/python-3149/)
-   (the Windows installer, 64-bit; the default settings are fine). Not Python 3.15: PyTorch
-   crashes on it.
-3. **Download [gimp-ai-fuzzy-select.zip](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip)**
+   (The Microsoft Store version of GIMP is untested.)
+2. **Download [gimp-ai-fuzzy-select.zip](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip)**
    and unzip it anywhere (right-click > Extract All).
-4. **Double-click `install.bat`** in the unzipped folder. If Windows asks whether to run it,
-   choose Run (or More info > Run anyway). It downloads about 4 GB, sets everything up and
-   ends with a set of tests.
-5. **Start GIMP** (restart it if it's open) and use **Select > AI Fuzzy Select...**
+3. **Double-click `install.bat`** in the unzipped folder. If Windows asks whether to run it,
+   choose Run (or More info > Run anyway). If you don't have a suitable Python, it offers to
+   download Python 3.14 from python.org and install it for you first (about 32 MB, for your
+   user only, no administrator rights needed; the download is checked against python.org's
+   checksum). Then it downloads about 4 GB, sets everything up and ends with a set of tests.
+4. **Start GIMP** (restart it if it's open) and use **Select > AI Fuzzy Select...**
+
+To install Python yourself instead: Python 3.14 from
+[python.org](https://www.python.org/downloads/) (the Windows installer, 64-bit; the default
+settings are fine). Not Python 3.15: PyTorch crashes on it. Not the Microsoft Store's Python
+either: Windows keeps the files it creates in a private folder, where GIMP doesn't see them,
+so the installer doesn't use it.
 
 The installer creates a virtual environment in `%LOCALAPPDATA%\gimp-ai-select`, installs
 PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the checkpoints (and
