@@ -258,6 +258,20 @@ def choose_torch_index(gpu):
     return "cu126"
 
 
+def choose_models(asked, checkpoint, cuda, big_gpu, install_dir):
+    """The SAM 2.1 models to install, the one to start with first. With an NVIDIA GPU both:
+    if the first can't analyse an image the backend falls back to small (see cmd_load in
+    aiselect_server.py). Without one, only small: on a laptop's CPU large took 9 s per image
+    against small's 2.4 s, for a 900 MB download. Large is added if --model (`asked`) or
+    --sam2-checkpoint asks for it, or kept if it was downloaded before."""
+    first = (asked or ["large" if big_gpu else "small"])[0]
+    if cuda:
+        return [first] + [m for m in MODELS if m != first]
+    given = [m for m in MODELS if checkpoint and Path(checkpoint).name == MODELS[m][1]]
+    have = [m for m in MODELS if (Path(install_dir) / "checkpoints" / MODELS[m][1]).exists()]
+    return list(dict.fromkeys([first] + (asked or []) + given + have + ["small"]))
+
+
 def find_gimp_plugins_dir():
     """The plug-ins folder of the newest GIMP 3.x user profile, or None."""
     if IS_WINDOWS:
@@ -1193,7 +1207,8 @@ def main():
     parser.add_argument("--no-soft-edges", action="store_true",
                         help="skip ViTMatte (the 'Soft edges' option); SAM2 only")
     parser.add_argument("--model", action="append", choices=list(MODELS),
-                        help="SAM 2.1 model to start with (both are installed; switch in the window). "
+                        help="SAM 2.1 model to start with (with an NVIDIA GPU both are installed; switch in "
+                             "the window; without one only small, unless this asks for large). "
                              "Default: large with an NVIDIA GPU of 3 GB or more, otherwise small")
     parser.add_argument("--sam2-checkpoint", help="use this existing sam2.1_hiera_large.pt or sam2.1_hiera_small.pt "
                                                   "instead of downloading it")
@@ -1236,10 +1251,7 @@ def main():
     # SAM 2.1 large needs about 1.5 GB of GPU memory, more with soft edges: on a 2 GB GPU it
     # ran out (the desktop uses some too), small needs about 0.6 GB.
     big_gpu = index.startswith("cu") and gpu is not None and (gpu[3] or 0) >= 3000
-    # Both models are installed: if the first can't analyse an image the backend falls back
-    # to small (see cmd_load in aiselect_server.py). The first is the one to start with.
-    first = (args.model or ["large" if big_gpu else "small"])[0]
-    models = [first] + [m for m in MODELS if m != first]
+    models = choose_models(args.model, args.sam2_checkpoint, index.startswith("cu"), big_gpu, install_dir)
     if args.sam2_checkpoint and Path(args.sam2_checkpoint).name not in [MODELS[m][1] for m in models]:
         sys.exit(f"--sam2-checkpoint must be one of {', '.join(MODELS[m][1] for m in models)} "
                  "(the file name says which model it is)")

@@ -124,7 +124,7 @@ takes about 1-3 seconds (the first time a few seconds more, to load LaMa).
 
 | Option | What it does |
 |---|---|
-| Model | SAM 2.1 large (best quality) or SAM 2.1 small (about 3× faster, half the GPU memory). Switching analyses the image again; your clicks are kept. If the graphics card doesn't have enough memory, AI Fuzzy Select switches to small, and then to the processor (CPU), by itself |
+| Model | SAM 2.1 large (best quality) or SAM 2.1 small (about 3× faster, half the GPU memory). Switching analyses the image again; your clicks are kept. If the graphics card doesn't have enough memory, AI Fuzzy Select switches to small, and then to the processor (CPU), by itself. Without an NVIDIA GPU only small is installed (unless you ask the installer for large), and this option isn't shown |
 | Granularity | Auto, Whole object, Part or Detail: whether each click selects, adds or subtracts a whole object or a part of it (e.g. tree → crown → branch) |
 | Threshold | Like Fuzzy Select's threshold: higher selects more, lower selects less (50 = SAM 2's own cut-off) |
 | Fill holes | Fill holes in the selection up to this diameter in pixels, e.g. a window in a wall you want selected as solid. Only holes completely surrounded by the selection are filled, and SAM 2 already includes holes smaller than about 10 px. 0 (default) = off, keeps every hole (e.g. sky between branches) |
@@ -191,8 +191,10 @@ installer and uninstaller stop a running backend before changing its files.
   get PyTorch's CUDA 12.6 build and newer ones the CUDA 13 build, so the NVIDIA driver must
   support that CUDA version. Without an NVIDIA GPU everything runs on the CPU; this is
   untested and analysing the image will be much slower.
-- **Disk space:** about 6 GB (PyTorch and other packages 4.4 GB, SAM 2.1 large and small
-  1.1 GB, ViTMatte checkpoint and code 0.5 GB, LaMa 0.2 GB); about 0.5 GB less with
+- **Disk space:** with an NVIDIA GPU about 6 GB (PyTorch and other packages 4.4 GB, SAM 2.1
+  large and small 1.1 GB, ViTMatte checkpoint and code 0.5 GB, LaMa 0.2 GB); without one
+  about 1.6 GB (PyTorch's CPU build is much smaller, and only SAM 2.1 small is installed:
+  on a CPU it analyses a photo in about 2.5 s, large takes about 9 s). About 0.5 GB less with
   `--no-soft-edges`.
 - **Internet access** during installation, to download the packages and checkpoints.
 - **Operating system:** tested on Windows 11 (GIMP 3.2.6) and Ubuntu 26.04 (GIMP 3 from
@@ -213,7 +215,8 @@ On Windows:
    choose Run (or More info > Run anyway). If you don't have a suitable Python, it offers to
    download Python 3.14 from python.org and install it for you first (about 32 MB, for your
    user only, no administrator rights needed; the download is checked against python.org's
-   checksum). Then it downloads about 4 GB, sets everything up and ends with a set of tests.
+   checksum). Then it downloads about 4 GB (about 1 GB without an NVIDIA GPU), sets
+   everything up and ends with a set of tests.
 4. **Start GIMP** (restart it if it's open) and use **Select > AI Fuzzy Select...**
 
 To install Python yourself instead: Python 3.14 from
@@ -244,7 +247,7 @@ after `python install_ai_select.py`:
 
 | Option | Use |
 |---|---|
-| `--model large` / `--model small` | Which SAM 2.1 model to start with (both are installed; switch in the window). Without it: large with an NVIDIA GPU of 3 GB or more, otherwise small |
+| `--model large` / `--model small` | Which SAM 2.1 model to start with. With an NVIDIA GPU both are installed (switch in the window); without one only small, unless you ask for large here. Without it: large with an NVIDIA GPU of 3 GB or more, otherwise small |
 | `--no-soft-edges` | Install SAM 2 only (no ViTMatte); the Soft edges option is greyed out |
 | `--sam2-checkpoint PATH` | Use an already downloaded `sam2.1_hiera_large.pt` or `sam2.1_hiera_small.pt` |
 | `--vitmatte-checkpoint PATH` | Use an already downloaded `ViTMatte_B_DIS.pth` |
