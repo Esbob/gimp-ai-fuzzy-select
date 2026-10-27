@@ -84,7 +84,8 @@ one for everything else (the rest):
 Each slice is shown in its own colour. Clicking an object inside a slice splits it in two:
 where objects overlap, the smaller one keeps the pixels, whichever you clicked first. So
 you can click a car and then its headlight, or the shopping bags first and then the car
-around them.
+around them. While you move the mouse, the slices a click would split are outlined with
+dashes, next to the outline of what it would select.
 
 **Slice** puts the slices and the rest in a new layer group right above the layer, each
 slice cropped to its object, and hides the original layer. Every pixel is in exactly one of

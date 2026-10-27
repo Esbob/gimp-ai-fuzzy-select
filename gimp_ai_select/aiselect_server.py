@@ -57,8 +57,10 @@ starts with {"cmd": "hello", "token": ...}.
       ("sharp_refined": those used). A final render waits for them.
   {"cmd": "sharp_status"}
       {"pending": number of sharper outlines still being worked out}
-  {"cmd": "hover", "point": [x, y], "threshold": 0-100, "granularity": ...}
-      the outline a click there would select: {"polygons": [[[x, y], ...], ...]}
+  {"cmd": "hover", "point": [x, y], "threshold": 0-100, "granularity": ..., "slices": false}
+      the outline a click there would select: {"polygons": [[[x, y], ...], ...]}; with
+      "slices", also the slices it would cut into (see hover_splits): "splits" {"click":
+      [numbers], "ctrl": [numbers]} and their "slice_outlines" {number: polygons}
   {"cmd": "bye"}   end this connection (in --listen mode the server waits for the next)
   {"cmd": "quit"}  stop the server
 Every reply has "id" (echoed from the request) and "ok", plus "error" on failure.
@@ -150,6 +152,7 @@ class Server:
         self.vitmatte = None
         self.lama = None  # for removing objects, loaded when first needed
         self.last_patch = None  # (image, selection hash, context, box, RGBA): the last removal
+        self.slice_state = None  # (image, labels, coarse owner, n, {slice: outline}): the last slicing
         self.lama_device = None
         self.image = None
         # (granularity, points) or ("box", ...) -> (full-res logits, low-res logits), oldest
@@ -394,7 +397,7 @@ class Server:
 
     def cmd_load(self, req):
         t0 = time.time()
-        self.last_patch = None  # (it holds on to the previous image)
+        self.last_patch = self.slice_state = None  # (they hold on to the previous image)
         self.free_lama()  # analysing the image needs the GPU memory more
         wanted = self.model_spec(req.get("model"))[0]
         if req.get("width"):  # raw 8-bit RGBA from the plugin
@@ -499,8 +502,10 @@ class Server:
         cut = (50 - req.get("threshold", 50)) / 25.0
         logits, _ = self.single_click(req["point"], req.get("granularity", "auto"))
         mask = logits > cut
-        return {"point": req["point"], "polygons": self.outline(mask), "area": int(mask.sum()),
-                "seconds": round(time.time() - t0, 3)}
+        reply = {"point": req["point"], "polygons": self.outline(mask), "area": int(mask.sum())}
+        if req.get("slices"):
+            reply["splits"], reply["slice_outlines"] = self.hover_splits(mask)
+        return dict(reply, seconds=round(time.time() - t0, 3))
 
     def box_logits(self, box, point=None):
         """Full-res mask logits for the object inside a box [x1, y1, x2, y2], optionally
@@ -772,7 +777,37 @@ class Server:
             else:  # back to the rest, which later objects can take again
                 labels[mask] = 0
                 owner[mask] = np.iinfo(np.uint32).max
+        # For hover_splits: the object sizes only on every n-th pixel (about 1000 along the long
+        # side), which is all it reads; in full they took 4 bytes a pixel (192 MB at 8000 px)
+        n = max(1, round(max(h, w) / 1000))
+        self.slice_state = (self.image, labels, owner[::n, ::n].copy(), n, {})
         return labels
+
+    def hover_splits(self, mask):
+        """When slicing: the slices a click on `mask` would cut into, by the same rule as
+        slice_labels (a click takes pixels from bigger objects' slices; Ctrl gives back any it
+        touches), from the last slicing; and their outlines. Small overlaps (along an outline)
+        don't count."""
+        state = self.slice_state
+        if state is None or state[0] is not self.image:
+            return {"click": [], "ctrl": []}, {}
+        _, labels, sub_owner, n, outlines = state
+        area = int(mask.sum())
+        # Counted on every n-th pixel (see slice_labels): on a 4000 px photo every pixel added
+        # 50 ms to each hover
+        sub_labels, sub_mask = labels[::n, ::n], mask[::n, ::n]
+        least = max(50, area // 200) / (n * n)
+
+        def cut(where):
+            counts = np.bincount(sub_labels[where], minlength=256)
+            return [int(k) for k in np.flatnonzero(counts[1:] >= least) + 1]
+
+        splits = {"click": cut(sub_mask & (sub_owner >= area)), "ctrl": cut(sub_mask)}
+        smallest = 0.0005 * labels.size  # (not every small hole in a slice: they hid the outline)
+        for k in set(splits["click"] + splits["ctrl"]) - set(outlines):
+            outlines[k] = [poly for poly in self.outline(labels == k)
+                           if cv2.contourArea(np.array(poly, np.float32)) >= smallest]
+        return splits, {str(k): outlines[k] for k in set(splits["click"] + splits["ctrl"])}
 
     def prune_cache(self):
         """Drop the oldest results of objects not in the current selection beyond

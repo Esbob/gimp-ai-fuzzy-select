@@ -647,6 +647,14 @@ t0 = time.time()
 r = call(cmd="render", objects=objs, slices=True, preview_out=os.path.join(work, "p5.png"))
 res["slice_preview_ms"] = round(1000 * (time.time() - t0))
 res["slices"]["preview"] = len(r["slices"]) == 3 and os.path.exists(r["preview"])
+# Hovering while slicing: the slices a click would split (a detail inside the disc's slice
+# splits it; the sky touches none), with their outlines
+call(cmd="render", objects=[{"sign": 1, "box": [240, 140, 560, 460], "slice": 1}], slices=True,
+     preview_out=os.path.join(work, "p6.png"))
+inside = call(cmd="hover", point=[400, 300], granularity="detail", slices=True)
+outside = call(cmd="hover", point=[700, 80], granularity="auto", slices=True)
+res["slices"]["hover shows the split"] = (inside["splits"]["click"] == [1] and outside["splits"]["click"] == []
+                                          and bool(inside["slice_outlines"].get("1")))
 t0 = time.time()
 res["mae_sharp"] = float(np.abs(final(click, sharp=True) - true).mean())
 res["sharp_s"] = round(time.time() - t0, 1)
@@ -968,6 +976,11 @@ try:
     res["slice_status"] = click(20, 500, Gdk.ModifierType.CONTROL_MASK, (60, 560))  # some sky
     res["slice_numbers"] = [o.get("slice") for o in dlg.objects]
     res["slice_hard_edges"] = not dlg.feather.get_sensitive() and not dlg.soft.get_sensitive()
+    # hovering while slicing also brings the slices a click would split
+    dlg.hover_polygons = dlg.hover_splits = None
+    dlg.hover_at([400, 300])
+    pump(lambda: dlg.hover_polygons is not None, 30)
+    res["slice_hover"] = dlg.hover_splits is not None and "click" in dlg.hover_splits[0]
     if settings.get("lamaCheckpoint"):  # removing an object: also hard edges
         dlg.output.set_active_id("remove")
         res["remove_hard_edges"] = (dlg.output.get_active_id() == "remove" and not dlg.feather.get_sensitive()
@@ -1125,7 +1138,7 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
               and "selected" in r["click"] and r["objects"] == [1, 1, -1] and bool(r["box_object"]) and "1 box" in r["box_drag"] and r["shift_cursor"]
               and r["select_enabled"] and (switch is None or (switch[1] and "selected" in switch[2]))
               and r["slice_numbers"] == [1, 2, 2, None] and "2 slices" in r["slice_status"]
-              and r["slice_hard_edges"] and r.get("remove_hard_edges", True)
+              and r["slice_hard_edges"] and r["slice_hover"] and r.get("remove_hard_edges", True)
               and all(r.get("remove_shown", [True])) and all(r.get("remove_switch", [True])))
     (ok if passed else fail)(
         f"window: options disabled while loading {r['sidebar_disabled_while_loading']}, ready "
@@ -1133,6 +1146,7 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
         f"{r['shift_cursor']}; status: {r['ctrl_click']!r}"
         + (f"; switched to model {switch[0]}, clicks kept {switch[1]}: {switch[2]!r}" if switch else "")
         + f"; slices {r['slice_numbers']}, soft edges and feather off {r['slice_hard_edges']}: {r['slice_status']!r}"
+        + f"; hover shows the slices a click would split {r['slice_hover']}"
         + (f"; remove the object offered, with soft edges and feather off: {r['remove_hard_edges']}; "
            f"the object removed shown, in the Result view, with the area option, said in the status, busy "
            f"cursor while waiting, and not after: "

@@ -408,6 +408,7 @@ class AISelectDialog(Gtk.Dialog):
         # Hover preview: the outline a click under the mouse would select.
         self.hover_target = None  # image point under the mouse, or None
         self.hover_polygons = None  # outline for the last hover reply
+        self.hover_splits = None  # when slicing: (slices a click would split, their outlines)
         self.hover_busy = False  # a hover request is in flight
         self.cursors = {}
         self.modifiers = 0  # Shift/Ctrl currently held, for the cursor's +/- sign
@@ -528,7 +529,8 @@ class AISelectDialog(Gtk.Dialog):
         self.hover = Gtk.CheckButton(label="Show object under cursor")
         self.hover.set_active(self.options["hover"])
         self.hover.set_tooltip_text("While you move the mouse, outline what a click would select "
-                                    "(yellow; green with Shift, red with Ctrl)")
+                                    "(yellow; green with Shift, red with Ctrl). When slicing, the "
+                                    "slices a click would split are outlined with dashes.")
         self.hover.connect("toggled", self.on_hover_toggled)
         side.pack_start(self.hover, False, False, 0)
         buttons = Gtk.Box(spacing=4)
@@ -1010,6 +1012,21 @@ class AISelectDialog(Gtk.Dialog):
                 colour = (0.3, 0.9, 0.3)
             else:
                 colour = (1.0, 0.85, 0.1)
+            if self.hover_splits and self.slicing():  # the slices the click would split: dashed
+                splits, outlines = self.hover_splits
+                which = "ctrl" if self.modifiers & Gdk.ModifierType.CONTROL_MASK else "click"
+                for rgb, width in (((0, 0, 0), 3.5), (colour, 1.8)):
+                    for k in splits[which]:
+                        for poly in outlines[str(k)]:
+                            cr.move_to(poly[0][0] * self.zoom, poly[0][1] * self.zoom)
+                            for x, y in poly[1:]:
+                                cr.line_to(x * self.zoom, y * self.zoom)
+                            cr.close_path()
+                    cr.set_source_rgb(*rgb)
+                    cr.set_line_width(width)
+                    cr.set_dash([] if rgb == (0, 0, 0) else [7, 5])
+                    cr.stroke()
+                cr.set_dash([])
             for rgb, width in (((0, 0, 0), 3.5), (colour, 1.8)):
                 for poly in self.hover_polygons:
                     cr.move_to(poly[0][0] * self.zoom, poly[0][1] * self.zoom)
@@ -1274,13 +1291,14 @@ class AISelectDialog(Gtk.Dialog):
             return
         self.hover_busy = True
         self.backend.request({"cmd": "hover", "point": point, "threshold": self.options["threshold"],
-                              "granularity": self.options["granularity"]},
+                              "granularity": self.options["granularity"], "slices": self.slicing()},
                              self.on_hover, coalesce="hover")
 
     def on_hover(self, reply):
         self.hover_busy = False
         if reply.get("ok") and self.hover_target is not None and self.options["hover"]:
             self.hover_polygons = reply["polygons"]
+            self.hover_splits = (reply["splits"], reply["slice_outlines"]) if reply.get("splits") else None
             self.area.queue_draw()
         # (after an error, wait for the mouse to move instead of asking again at once)
         if reply.get("ok") and self.hover_target is not None and self.hover_target != reply.get("point"):
@@ -1289,6 +1307,7 @@ class AISelectDialog(Gtk.Dialog):
 
     def clear_hover(self):
         self.hover_target = None
+        self.hover_splits = None
         if self.hover_polygons:
             self.hover_polygons = None
             self.area.queue_draw()
