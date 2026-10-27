@@ -3,10 +3,12 @@
 An AI-based fuzzy select tool for [GIMP](https://www.gimp.org/) 3. It works like GIMP's **Fuzzy Select**, but it
 selects by *object* instead of by *colour*: click on something in the image and
 [SAM 2](https://github.com/facebookresearch/sam2) (Meta's Segment Anything Model 2) works
-out which pixels belong to it. The result is a normal GIMP selection with marching ants.
+out which pixels belong to it. The result can be a normal GIMP selection, a new layer with
+the object cut out or masked, a mask or a channel, the layer sliced into a layer per object,
+or the object removed and filled in with background.
 
 <p align="center">
-  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download.png" width="220" alt="Download"></a><br>
+  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download.png" width="305" alt="Download Installer"></a><br>
   <sub>For GIMP 3 on Windows and Linux: unzip it, then double-click <code>install.bat</code> (Windows) or run <code>sh install.sh</code> (Linux) · <a href="#installation">installation steps</a> · macOS untested</sub>
 </p>
 
@@ -129,7 +131,7 @@ takes about 1-3 seconds (the first time a few seconds more, to load LaMa).
 | Feather | Soften the selection edge, in pixels |
 | Sharper outlines | More accurate outlines on large photos, especially for small objects: each object is looked at again on a crop around it. Takes a few seconds per object, in the background; the preview updates when it's ready |
 | Soft edges (ViTMatte) | Turn fuzzy edges such as fur and hair into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte), picking out individual hairs near the object's outline. On hard edges it mostly makes the outline smoother and more accurate. The effect is best seen in the **Mask** view. The preview shows soft edges a moment after each change; pressing **Select** computes them at full resolution |
-| Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; a **Channel**, leaving GIMP's selection alone; **Slices** (see [Slicing an image into layers](#slicing-an-image-into-layers)); or **Remove the object** (see [Removing an object](#removing-an-object)). The button's label changes to match |
+| Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; a **Channel**, leaving GIMP's selection alone; **Slices** (see [Slicing an image into layers](#slicing-an-image-into-layers)); or **Remove the object** (see [Removing an object](#removing-an-object)) |
 | Surroundings | Only for **Remove the object**: how much of the image around the object is used to make up the background (see [Removing an object](#removing-an-object)) |
 | Existing selection in GIMP | Only for a Selection result, and only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
