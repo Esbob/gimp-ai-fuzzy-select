@@ -30,8 +30,10 @@ Only the Python standard library is needed to run this script.
 import argparse
 import contextlib
 import hashlib
+import http.client
 import json
 import locale
+import math
 import os
 import platform
 import shutil
@@ -41,7 +43,9 @@ import subprocess
 import sys
 import tempfile
 import textwrap
+import threading
 import time
+import urllib.error
 import urllib.request
 import zipfile
 from pathlib import Path
@@ -73,8 +77,15 @@ DETECTRON2 = ("facebookresearch/detectron2", "1e3e13bbf607b54f62205c4c3392252182
 LAMA_URL = "https://github.com/Sanster/models/releases/download/add_big_lama/big-lama.pt"
 LAMA_SHA256 = "344c77bbcb158f17dd143070d1e789f38a66c04202311ae3a258ef66667a9ea9"
 VITMATTE_GDRIVE_ID = "1d97oKuITCeWgai2Tf3iNilt6rMSSYzkW"  # ViTMatte_B_DIS.pth (Matte Anything's README)
+VITMATTE_BYTES = 386838041
 
 TORCH_INDEX = "https://download.pytorch.org/whl/{}"
+# For the setup's progress bar: the download of each PyTorch build in MB (PyTorch 2.14.1 for
+# Windows; the CUDA 12.6 build bundles more), and how long the tests take in seconds (with
+# an NVIDIA GPU, on the CPU), measured on a laptop with a GTX 1050 Ti
+TORCH_MB = {"cu130": 2000, "cu126": 2630, "cpu": 126}
+TEST_S = {"backend": (100, 45), "gimp": (55, 40), "window": (20, 20)}  # with --full-tests
+QUICK_TEST_S = {"backend": (20, 25), "gimp": (15, 15)}  # (GIMP took 5-9 s)
 SOFT_EDGE_PACKAGES = [
     "setuptools<81",  # detectron2's model_zoo still uses pkg_resources
     "fvcore>=0.1.5,<0.1.6",
@@ -114,24 +125,162 @@ class InstallError(Exception):
     pass
 
 
-def run(cmd, env=None, cwd=None, capture=False):
-    """Run a command, streaming output unless capture=True. Raises on failure."""
+class Progress:
+    """The Windows setup's progress bar (--progress): lines "@@progress <percent>\t<what>\t
+    <detail>" on stdout, which setup.iss reads. Each stage of the install has a weight, about
+    the seconds it takes on a laptop with a 100 Mbit/s connection: downloads move with their
+    bytes, other stages with the time they usually take (slowing down near the end if they
+    take longer). Without --progress it does nothing."""
+    MB_PER_S = 10
+
+    def __init__(self, stages=None):
+        self.stages = stages or {}  # key -> (what, weight in seconds, moves with the time)
+        self.total = sum(w for _, w, _ in self.stages.values()) or 1
+        self.key, self.fraction, self.detail, self.since = None, 0.0, "", 0.0
+        self.lock = threading.Lock()
+        self.last = None
+        if self.stages:
+            threading.Thread(target=self.tick, daemon=True).start()
+
+    def start(self, key, detail=""):
+        keys = list(self.stages)
+        if key in keys and (self.key is None or keys.index(key) > keys.index(self.key)):  # only forward
+            with self.lock:
+                self.key, self.fraction, self.detail, self.since = key, 0.0, detail, time.time()
+            self.emit()
+
+    def set(self, fraction, detail=None):
+        if self.key:
+            with self.lock:
+                self.fraction = max(self.fraction, min(fraction, 1.0))
+                if detail is not None:
+                    self.detail = detail
+            self.emit()
+
+    def bytes(self, done, total):
+        unit, scale = ("GB", 1e9) if total >= 1e9 else ("MB", 1e6)
+        self.set(done / total if total else 0.0,
+                 f"{done / scale:.1f} of {total / scale:.1f} {unit}" if unit == "GB"
+                 else f"{done / scale:.0f} of {total / scale:.0f} {unit}")
+
+    def tick(self):
+        while True:
+            time.sleep(0.5)
+            with self.lock:
+                if not self.key or not self.stages[self.key][2]:
+                    continue
+                # linear up to 90% at the usual time, then ever slower
+                t = (time.time() - self.since) / self.stages[self.key][1]
+                self.fraction = max(self.fraction, 0.9 * t if t < 1 else 0.9 + 0.09 * (1 - math.exp(1 - t)))
+            self.emit()
+
+    def emit(self, final=False):
+        if not self.stages:
+            return
+        with self.lock:
+            keys = list(self.stages)
+            done = sum(self.stages[k][1] for k in keys[:keys.index(self.key)]) if self.key else 0
+            pct = 100.0 if final else 100.0 * (done + self.stages[self.key][1] * self.fraction) / self.total
+            line = f"@@progress {pct:.1f}\t{self.stages[self.key][0] if self.key else ''}\t{self.detail}"
+            if line == self.last:
+                return
+            self.last = line
+        print(line, flush=True)
+
+
+PROGRESS = Progress()
+
+
+def setup_stages(args, index, models, soft, install_dir, gimp_console):
+    """The stages of this install for the setup's progress bar, in the order they run, with
+    their weights (see Progress); stages with nothing to do are left out."""
+    py, checkpoints = venv_python(install_dir / "venv"), install_dir / "checkpoints"
+    cpu = not index.startswith("cu")
+    mb = lambda n: f"{n / 1000:.1f} GB" if n >= 1000 else f"{n:.0f} MB"
+    stages = {"prepare": ("Getting ready", 15 if py.exists() else 30, True)}
+    if not (py.exists() and installed_torch_build(py) == index):
+        size = TORCH_MB.get(index, max(TORCH_MB.values()))
+        stages["torch_download"] = (f"Downloading the AI engine for {'the processor' if cpu else 'your NVIDIA graphics card'}"
+                                    f" ({mb(size)})", size / Progress.MB_PER_S, False)
+        stages["torch_install"] = ("Installing the AI engine", 160 if cpu else 210, True)
+    stages["sam2"] = ("Installing SAM 2, the AI that finds objects", 60, True)
+    for m in models:
+        if not (args.sam2_checkpoint and Path(args.sam2_checkpoint).name == MODELS[m][1]) \
+                and not (checkpoints / MODELS[m][1]).exists():
+            stages[f"model_{m}"] = (f"Downloading the AI model SAM 2.1 {m} ({mb(MODELS[m][2])})",
+                                    MODELS[m][2] / Progress.MB_PER_S, False)
+    if not (checkpoints / "big-lama.pt").exists():
+        stages["lama"] = ("Downloading LaMa, for removing objects (206 MB)", 206 / Progress.MB_PER_S, False)
+    if soft:
+        stages["soft"] = ("Installing soft edges, for hair and fur", 110, True)
+        if not args.vitmatte_checkpoint and not (checkpoints / "ViTMatte_B_DIS.pth").exists():
+            stages["vitmatte"] = (f"Downloading the model for soft edges ({mb(VITMATTE_BYTES / 1e6)})",
+                                  VITMATTE_BYTES / 1e6 / Progress.MB_PER_S, False)
+    stages["plugin"] = ("Installing the plug-in in GIMP", 1, True)
+    tests = TEST_S if args.full_tests else QUICK_TEST_S
+    stages["test_backend"] = ("Testing the AI", tests["backend"][cpu], True)
+    if gimp_console:
+        stages["test_gimp"] = ("Testing the plug-in in GIMP", tests["gimp"][cpu], True)
+        if args.full_tests:
+            stages["test_window"] = ("Testing the AI Fuzzy Select window", tests["window"][cpu], True)
+    return stages
+
+
+def run(cmd, env=None, cwd=None, capture=False, on_line=None):
+    """Run a command, streaming output unless capture=True; on_line, if given, gets each line
+    of the output instead (stderr included). Raises on failure."""
     printable = " ".join(str(c) for c in cmd)
     info(f"$ {printable}" if len(printable) < 300 else f"$ {printable[:300]}...")
     full_env = os.environ.copy()
     if env:
         full_env.update(env)
-    result = subprocess.run(
-        [str(c) for c in cmd], env=full_env, cwd=cwd,
-        stdout=subprocess.PIPE if capture else None,
-        stderr=subprocess.STDOUT if capture else None,
-        text=True, encoding="utf-8", errors="replace",
-    )
+    if on_line:
+        full_env["PYTHONIOENCODING"] = "utf-8"
+        proc = subprocess.Popen([str(c) for c in cmd], env=full_env, cwd=cwd, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding="utf-8", errors="replace")
+        for line in proc.stdout:
+            on_line(line.rstrip("\n"))
+        result = subprocess.CompletedProcess(cmd, proc.wait(), "")
+    else:
+        result = subprocess.run(
+            [str(c) for c in cmd], env=full_env, cwd=cwd,
+            stdout=subprocess.PIPE if capture else None,
+            stderr=subprocess.STDOUT if capture else None,
+            text=True, encoding="utf-8", errors="replace",
+        )
     if result.returncode != 0:
         if capture:
             print(result.stdout)
         raise InstallError(f"Command failed (exit {result.returncode}): {printable[:300]}")
     return result.stdout if capture else ""
+
+
+def pip_install(py, *args, env=None, download=None, install=None):
+    """pip install. For the setup's progress bar its downloads move stage `download`, and
+    stage `install` starts when pip starts installing."""
+    if not PROGRESS.stages:
+        return run([py, "-m", "pip", "install", *args], env=env)
+    got = {"done": 0, "file": 0, "now": 0}  # bytes of the files before, this file's size and bytes
+
+    def on_line(line):
+        if line.startswith("Progress ") and " of " in line:  # pip's --progress-bar raw
+            now, size = (int(x) for x in line[9:].split(" of "))
+            if size != got["file"] or now < got["now"]:  # the next file
+                got["done"] += got["file"]
+                got["file"] = size
+            got["now"] = now
+            if download and PROGRESS.key == download:
+                expected = PROGRESS.stages[download][1] * Progress.MB_PER_S * 1e6
+                PROGRESS.bytes(got["done"] + now, max(expected, got["done"] + size))
+            return
+        print(line, flush=True)
+        if line.startswith("Installing collected packages") and install:
+            PROGRESS.start(install)
+
+    if download:
+        PROGRESS.start(download)
+    # (no cache: it would keep another copy of PyTorch's 2 GB download)
+    run([py, "-m", "pip", "install", "--progress-bar", "raw", "--no-cache-dir", *args], env=env, on_line=on_line)
 
 
 @contextlib.contextmanager
@@ -159,29 +308,59 @@ def temp_on_disk(install_dir):
         shutil.rmtree(tmp, ignore_errors=True)
 
 
-def download(url, dest):
+def download(url, dest, report=True, attempts=5):
+    """Download url to dest; `report`: the download is the setup's current progress stage.
+    An interrupted download is tried again, continuing where it stopped (the server closed
+    the connection in the middle of a checkpoint once); so is one an earlier run left as
+    .part."""
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
-    req = urllib.request.Request(url, headers={"User-Agent": "ai-select-installer"})
-    with urllib.request.urlopen(req) as resp, open(tmp, "wb") as out:
-        total = int(resp.headers.get("Content-Length") or 0)
-        done, last = 0, 0.0
-        while True:
-            chunk = resp.read(1 << 20)
-            if not chunk:
-                break
-            out.write(chunk)
-            done += len(chunk)
-            if total and time.time() - last > 0.5:
-                print(f"\r    {done / 1e6:8.1f} / {total / 1e6:.1f} MB ({100 * done / total:5.1f}%)",
-                      end="", flush=True)
-                last = time.time()
-        if total:
-            print(f"\r    {done / 1e6:8.1f} / {total / 1e6:.1f} MB (100.0%)", flush=True)
-    if total and done != total:
-        tmp.unlink(missing_ok=True)
-        raise InstallError(f"Incomplete download of {url}: got {done} of {total} bytes")
+    for attempt in range(1, attempts + 1):
+        have = tmp.stat().st_size if tmp.exists() else 0
+        headers = {"User-Agent": "ai-select-installer"}
+        if have:
+            headers["Range"] = f"bytes={have}-"
+        try:
+            with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=60) as resp:
+                resumed = have and resp.status == 206  # (else the server sends it all again)
+                done = have if resumed else 0
+                total = int(resp.headers.get("Content-Length") or 0) + done
+                last = 0.0
+                with open(tmp, "ab" if resumed else "wb") as out:
+                    while True:
+                        chunk = resp.read(1 << 20)
+                        if not chunk:
+                            break
+                        out.write(chunk)
+                        done += len(chunk)
+                        if total and time.time() - last > 0.5:
+                            if PROGRESS.stages:
+                                if report:
+                                    PROGRESS.bytes(done, total)
+                            else:
+                                print(f"\r    {done / 1e6:8.1f} / {total / 1e6:.1f} MB ({100 * done / total:5.1f}%)",
+                                      end="", flush=True)
+                            last = time.time()
+            if total and done != total:
+                raise ConnectionError(f"got {done} of {total} bytes")
+            break
+        except urllib.error.HTTPError as e:
+            if e.code < 500 and e.code != 416:
+                raise InstallError(f"The download of {url} failed: {e}")
+            if e.code == 416:  # the range asked for is past the end: start again
+                tmp.unlink(missing_ok=True)
+            error = e
+        except (OSError, http.client.HTTPException) as e:  # (the connection was reset, a timeout)
+            error = e
+        if attempt == attempts:
+            raise InstallError(f"The download of {url} failed: {error}. Is the computer connected to the "
+                               "internet? Running the installer again continues the download.")
+        print(f"\n    The download was interrupted ({error}); trying again", flush=True)
+        time.sleep(5 * attempt)
+    if total:
+        print(("" if PROGRESS.stages else "\r") + f"    {done / 1e6:8.1f} / {total / 1e6:.1f} MB (100.0%)",
+              flush=True)
     os.replace(tmp, dest)
 
 
@@ -193,7 +372,7 @@ def fetch_repo(repo, commit, dest):
         return dest
     dest.parent.mkdir(parents=True, exist_ok=True)
     zip_path = dest.parent / f"{dest.name}.zip"
-    download(f"https://github.com/{repo}/archive/{commit}.zip", zip_path)
+    download(f"https://github.com/{repo}/archive/{commit}.zip", zip_path, report=False)
     extract_dir = Path(tempfile.mkdtemp(dir=dest.parent))
     with zipfile.ZipFile(zip_path) as zf:
         zf.extractall(extract_dir)
@@ -258,14 +437,15 @@ def choose_torch_index(gpu):
     return "cu126"
 
 
-def choose_models(asked, checkpoint, cuda, big_gpu, install_dir):
+def choose_models(asked, checkpoint, cuda, big_gpu, install_dir, small_only=False):
     """The SAM 2.1 models to install, the one to start with first. With an NVIDIA GPU both:
     if the first can't analyse an image the backend falls back to small (see cmd_load in
     aiselect_server.py). Without one, only small: on a laptop's CPU large took 9 s per image
     against small's 2.4 s, for a 900 MB download. Large is added if --model (`asked`) or
-    --sam2-checkpoint asks for it, or kept if it was downloaded before."""
-    first = (asked or ["large" if big_gpu else "small"])[0]
-    if cuda:
+    --sam2-checkpoint asks for it, or kept if it was downloaded before. `small_only`: small,
+    also with an NVIDIA GPU (and large only if it was downloaded before)."""
+    first = (asked or ["large" if big_gpu and not small_only else "small"])[0]
+    if cuda and not small_only:
         return [first] + [m for m in MODELS if m != first]
     given = [m for m in MODELS if checkpoint and Path(checkpoint).name == MODELS[m][1]]
     have = [m for m in MODELS if (Path(install_dir) / "checkpoints" / MODELS[m][1]).exists()]
@@ -298,6 +478,16 @@ def find_gimp_console():
             return Path(shutil.which(name))
     candidates = []
     if IS_WINDOWS:
+        # where GIMP's installer says it installed GIMP (any folder), then its default folders
+        import winreg
+        key = r"Software\Microsoft\Windows\CurrentVersion\Uninstall\GIMP-3_is1"
+        for root, view in ((winreg.HKEY_CURRENT_USER, 0), (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_64KEY),
+                           (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_WOW64_32KEY)):
+            try:
+                with winreg.OpenKey(root, key, 0, winreg.KEY_READ | view) as k:
+                    candidates.append(Path(winreg.QueryValueEx(k, "InstallLocation")[0]) / "bin" / "gimp-console-3.exe")
+            except OSError:
+                pass
         for base in [os.environ.get("LOCALAPPDATA", "") + r"\Programs", os.environ.get("ProgramFiles", "")]:
             candidates.append(Path(base) / "GIMP 3" / "bin" / "gimp-console-3.exe")
     elif sys.platform == "darwin":
@@ -399,17 +589,29 @@ def stop_backend():
 def create_venv(venv_dir):
     py = venv_python(venv_dir)
     if py.exists():
-        out = subprocess.run([str(py), "-c", "import sys; print('%d.%d' % sys.version_info[:2])"],
+        out = subprocess.run([str(py), "-c", "import sys, pip; print('%d.%d' % sys.version_info[:2])"],
                              capture_output=True, text=True)
         version = out.stdout.strip()
         if out.returncode or version not in SUPPORTED_PYTHONS:
-            sys.exit(f"The existing environment {venv_dir} doesn't work"
-                     f"{f' (it uses Python {version})' if version else ''}: probably the Python it was "
-                     f"made with was removed or upgraded. Delete the folder {venv_dir} and run the "
-                     "installer again (the downloaded checkpoints are kept).")
+            # (the Python it was made with was removed or upgraded: the checkpoints and
+            # sources next to it are kept)
+            info(f"The existing environment {venv_dir} doesn't work"
+                 f"{f' (it uses Python {version})' if version else ''}; making a new one")
+            shutil.rmtree(venv_dir)
+    if py.exists():
         ok(f"Reusing existing virtual environment: {venv_dir}")
     else:
-        run([sys.executable, "-m", "venv", venv_dir])
+        try:
+            run([sys.executable, "-m", "venv", venv_dir])
+        except InstallError:
+            # Seconds after the Windows setup had installed Python, ensurepip once failed (exit 1)
+            # although it had installed pip, perhaps as a virus scanner held a new file: use the
+            # environment if pip works in it, else make it again
+            if not py.exists() or subprocess.run([str(py), "-c", "import pip"], capture_output=True).returncode:
+                info("Creating the virtual environment failed; trying again")
+                time.sleep(5)
+                shutil.rmtree(venv_dir, ignore_errors=True)
+                run([sys.executable, "-m", "venv", venv_dir])
         ok(f"Created virtual environment: {venv_dir}")
     run([py, "-m", "pip", "install", "--upgrade", "pip", "setuptools<81", "wheel"], capture=True)
     return py
@@ -433,9 +635,12 @@ def install_sam2(py, index, src):
     again = ["--force-reinstall", "--no-deps"] if known and have and have != index else []
     if again:
         info(f"Replacing the installed PyTorch ({have}) with the {index} build")
-        run([py, "-m", "pip", "install", *again, "torch", "torchvision", "--index-url", TORCH_INDEX.format(index)])
-    run([py, "-m", "pip", "install", "torch", "torchvision", "--index-url", TORCH_INDEX.format(index)])
-    run([py, "-m", "pip", "install", "opencv-python-headless", "numpy"])
+    torch = ["torch", "torchvision", "--index-url", TORCH_INDEX.format(index)]
+    if again:
+        pip_install(py, *again, *torch, download="torch_download", install="torch_install")
+    pip_install(py, *torch, download="torch_download", install="torch_install")
+    PROGRESS.start("sam2")
+    pip_install(py, "opencv-python-headless", "numpy")
     sam2 = fetch_repo(*SAM2, src / "sam2")
     # --no-build-isolation: SAM2's build requires torch and would otherwise download a
     # second copy. SAM2_BUILD_CUDA=0: its optional CUDA extension needs a compiler; SAM2
@@ -446,10 +651,11 @@ def install_sam2(py, index, src):
 def install_soft_edges(py, src):
     """ViTMatte without compiling anything: detectron2 and Matte Anything's ViTMatte code
     are put on the path as source; Matte Anything uses only detectron2's pure-Python parts."""
-    run([py, "-m", "pip", "install", *SOFT_EDGE_PACKAGES])
+    PROGRESS.start("soft")
+    pip_install(py, *SOFT_EDGE_PACKAGES)
     # fairscale's old setup.py builds a broken "unknown-0.0.0" wheel in an isolated build
     # with current setuptools; build it against the venv's own setuptools instead.
-    run([py, "-m", "pip", "install", "--no-build-isolation", "fairscale"])
+    pip_install(py, "--no-build-isolation", "fairscale")
     d2 = fetch_repo(*DETECTRON2, src / "detectron2")
     zoo_configs = d2 / "detectron2" / "model_zoo" / "configs"
     if not zoo_configs.exists():  # setup.py normally links these into the package
@@ -482,6 +688,7 @@ def get_sam2_checkpoint(name, dest_dir, existing):
         ok(f"Already present: {dest}")
     else:
         info(f"Downloading {file} (~{MODELS[name][2]} MB)")
+        PROGRESS.start(f"model_{name}")
         download(MODEL_URL.format(file), dest)
     return dest
 
@@ -491,6 +698,7 @@ def get_lama_checkpoint(dest):
         ok(f"Already present: {dest}")
         return dest
     info("Downloading big-lama.pt (~206 MB)")
+    PROGRESS.start("lama")
     download(LAMA_URL, dest)
     digest = hashlib.sha256()
     with open(dest, "rb") as f:
@@ -513,13 +721,30 @@ def get_vitmatte_checkpoint(py, dest, existing):
         ok(f"Already present: {dest}")
         return dest
     info("Downloading ViTMatte_B_DIS.pth from Google Drive")
+    PROGRESS.start("vitmatte")
+    downloading = threading.Event()
+    downloading.set()
+
+    def watch():  # gdown downloads to <name>*.part next to it
+        while downloading.is_set():
+            try:
+                PROGRESS.bytes(sum(f.stat().st_size for f in dest.parent.glob(dest.name + "*.part")),
+                               VITMATTE_BYTES)
+            except OSError:
+                pass
+            time.sleep(0.5)
+
+    if PROGRESS.stages:
+        threading.Thread(target=watch, daemon=True).start()
     try:
-        run([py, "-m", "gdown", VITMATTE_GDRIVE_ID, "-O", dest])
+        run([py, "-m", "gdown", VITMATTE_GDRIVE_ID, "-O", dest] + (["--quiet"] if PROGRESS.stages else []))
     except InstallError:
         raise InstallError(
             "Google Drive refused the ViTMatte download (it rate-limits). Download it from "
             f"https://drive.google.com/file/d/{VITMATTE_GDRIVE_ID}/view, then re-run with "
             "--vitmatte-checkpoint path/to/ViTMatte_B_DIS.pth (or use --no-soft-edges).")
+    finally:
+        downloading.clear()
     return dest
 
 
@@ -1133,10 +1358,40 @@ def run_gimp_test(py, gimp_console, work, remove):
     return bool(passed and unusual_ok)
 
 
-def run_window_test(gimp_console, plugin_dir, settings, work):
+def gimp_python_of(gimp_console):
+    """The Python GIMP runs its plug-ins with (next to gimp-console), or None if not found."""
     gimp_python = gimp_console.parent / ("python.exe" if IS_WINDOWS else "python3")
-    if not gimp_python.exists():
-        info(f"Window test skipped: GIMP's Python not found at {gimp_python}")
+    return gimp_python if gimp_python.exists() else None
+
+
+def gimp_python_problem(gimp_console):
+    """Why GIMP couldn't load the plug-in, or None. Its window draws with cairo: without
+    Python's cairo bindings GIMP doesn't load the plug-in at all, so it's missing from the
+    Select menu without a word. Debian's gimp package (3.0.4 on Debian 13) doesn't bring them;
+    Ubuntu's desktop has them, as does GIMP for Windows. GIMP for Windows can be installed
+    without its Python (the Compact install, or Custom without it): then there's no Python
+    plug-in at all."""
+    if IS_WINDOWS and gimp_console and not gimp_python_of(gimp_console):
+        return (f"GIMP ({gimp_console.parent.parent}) was installed without its Python support, which "
+                "AI Fuzzy Select needs. Run GIMP's installer again and choose Full (or Custom with "
+                "Python plug-in support), then run this installer again.")
+    gimp_python = gimp_console and gimp_python_of(gimp_console)
+    if not gimp_python:
+        return None
+    check = subprocess.run([str(gimp_python), "-c", "import cairo, gi; gi.require_foreign('cairo')"],
+                           capture_output=True, text=True)
+    if check.returncode == 0:
+        return None
+    return (f"GIMP's Python ({gimp_python}) can't load cairo, which AI Fuzzy Select's window draws "
+            "with; without it GIMP doesn't load the plug-in at all. Install Python's cairo bindings "
+            "for GIMP (on Debian and Ubuntu: sudo apt install python3-gi-cairo), then run the "
+            "installer again.")
+
+
+def run_window_test(gimp_console, plugin_dir, settings, work):
+    gimp_python = gimp_python_of(gimp_console)
+    if not gimp_python:
+        info(f"Window test skipped: GIMP's Python not found next to {gimp_console}")
         return True
     proc = subprocess.run([str(gimp_python), "-c", WINDOW_TEST, plugin_dir / "aiselect.py",
                            json.dumps(settings), Path(work, "input.png")],
@@ -1169,8 +1424,81 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
     return bool(passed)
 
 
-def run_tests(py, settings, plugin_dir, soft, expect_cuda, gimp_console):
-    step("Running tests")
+# The quick check after an install: the backend loads the model and one click selects the disc
+QUICK_TEST = r"""
+import json, os, subprocess, sys, time
+import numpy as np
+work, server, settings = sys.argv[1], sys.argv[2], sys.argv[3]
+true = np.load(os.path.join(work, "alpha_true.npy"))
+proc = subprocess.Popen([sys.executable, server, settings], stdin=subprocess.PIPE,
+                        stdout=subprocess.PIPE, stderr=open(os.path.join(work, "server.err"), "w"), text=True)
+def call(**req):
+    req["id"] = 1
+    proc.stdin.write(json.dumps(req) + "\n"); proc.stdin.flush()
+    reply = json.loads(proc.stdout.readline())
+    if not reply["ok"]:
+        raise SystemExit("backend error: " + reply["error"])
+    return reply
+t0 = time.time()
+device = call(cmd="load", image=os.path.join(work, "input.png"), preview=os.path.join(work, "p.png"),
+              preview_width=400, preview_height=300)["device"]
+load_s = round(time.time() - t0, 1)
+out = os.path.join(work, "sel.raw")
+call(cmd="render", objects=[{"sign": 1, "points": [[400, 300, 1]]}], final=True, out=out)
+mae = float(np.abs(np.fromfile(out, np.uint8).reshape(true.shape) / 255 - true).mean())
+call(cmd="quit"); proc.wait(timeout=30)
+print("RESULT " + json.dumps({"device": device, "load_s": load_s, "mae": mae}))
+"""
+
+# ... and GIMP lists the plug-in (it doesn't when it can't load it)
+GIMP_CHECK = r"""
+import gi, json
+gi.require_version("Gimp", "3.0")
+from gi.repository import Gimp
+open(REPORT, "w").write(json.dumps({"registered": Gimp.get_pdb().lookup_procedure("plug-in-ai-select") is not None}))
+"""
+
+
+def run_quick_test(py, work, plugin_dir, settings, expect_cuda):
+    proc = subprocess.run([str(py), "-c", QUICK_TEST, work, plugin_dir / "aiselect_server.py", json.dumps(settings)],
+                          capture_output=True, text=True, encoding="utf-8", errors="replace")
+    line = next((l for l in proc.stdout.splitlines() if l.startswith("RESULT ")), None)
+    if line is None:
+        fail("The AI didn't work:")
+        err = Path(work, "server.err")
+        tail = (proc.stdout + proc.stderr + (err.read_text(errors="replace") if err.exists() else ""))
+        print(textwrap.indent("\n".join(tail.strip().splitlines()[-20:]), "      "))
+        return False
+    r = json.loads(line[7:])
+    passed = r["mae"] < 0.03 and (r["device"] == "cuda" or not expect_cuda)
+    (ok if passed else fail)(f"a click selects the object (error vs true alpha {r['mae']:.4f}; on the "
+                             f"{'graphics card' if r['device'] == 'cuda' else 'processor'}, the image analysed "
+                             f"in {r['load_s']} s)")
+    return passed
+
+
+def run_gimp_check(gimp_console, work):
+    report = Path(work, "gimp_check.json")
+    script = Path(work, "gimp_check.py")
+    script.write_text(GIMP_CHECK.replace("REPORT", repr(str(report))), encoding="utf-8")
+    t0 = time.time()
+    try:
+        subprocess.run([str(gimp_console), "-i", "--batch-interpreter=python-fu-eval",
+                        "-b", f"exec(open({str(script)!r}, encoding='utf-8').read())", "--quit"],
+                       capture_output=True, timeout=600)
+    except subprocess.TimeoutExpired:
+        fail("Headless GIMP did not finish within 10 minutes")
+        return False
+    registered = report.exists() and json.loads(report.read_text()).get("registered")
+    (ok if registered else fail)(f"GIMP {'has' if registered else 'did not load'} the plug-in "
+                                 f"({time.time() - t0:.0f} s incl. GIMP start)")
+    return bool(registered)
+
+
+def run_tests(py, settings, plugin_dir, soft, expect_cuda, gimp_console, full=False):
+    """The quick check, or (full) all the tests: every option, inside GIMP and the window."""
+    step("Running tests" if full else "Checking the installation")
+    PROGRESS.start("test_backend")
     try:
         out = run([py, "-c", IMPORT_TEST] + (["soft"] if soft else []), capture=True)
     except InstallError as e:
@@ -1185,9 +1513,17 @@ def run_tests(py, settings, plugin_dir, soft, expect_cuda, gimp_console):
     work = Path(tempfile.mkdtemp(prefix="ai_select_test_"))
     try:
         run([py, "-c", SYNTHETIC_IMAGE, work], capture=True)
+        if not full:
+            passed = run_quick_test(py, work, plugin_dir, settings, expect_cuda)
+            if gimp_console:
+                PROGRESS.start("test_gimp")
+                passed = run_gimp_check(gimp_console, work) and passed
+            return passed
         passed = run_backend_test(py, work, plugin_dir, settings, soft)
         if gimp_console:
+            PROGRESS.start("test_gimp")
             passed = run_gimp_test(py, gimp_console, work, bool(settings.get("lamaCheckpoint"))) and passed
+            PROGRESS.start("test_window")
             passed = run_window_test(gimp_console, plugin_dir, settings, work) and passed
         else:
             info("GIMP tests skipped: gimp-console not found")
@@ -1210,12 +1546,19 @@ def main():
                         help="SAM 2.1 model to start with (with an NVIDIA GPU both are installed; switch in "
                              "the window; without one only small, unless this asks for large). "
                              "Default: large with an NVIDIA GPU of 3 GB or more, otherwise small")
+    parser.add_argument("--small-only", action="store_true",
+                        help="install only SAM 2.1 small, also with an NVIDIA GPU (a 900 MB smaller download)")
     parser.add_argument("--sam2-checkpoint", help="use this existing sam2.1_hiera_large.pt or sam2.1_hiera_small.pt "
                                                   "instead of downloading it")
     parser.add_argument("--vitmatte-checkpoint", help="use this existing ViTMatte_B_DIS.pth instead of downloading")
     parser.add_argument("--cpu", action="store_true", help="force a CPU-only PyTorch")
     parser.add_argument("--torch-index", help="override the PyTorch wheel index, e.g. cu126, cu130, cpu")
     parser.add_argument("--test-only", action="store_true", help="skip installing, just run the tests")
+    parser.add_argument("--full-tests", action="store_true",
+                        help="run all the tests (every option, inside GIMP and its window; a few minutes) "
+                             "instead of the quick check that the AI and GIMP work")
+    parser.add_argument("--progress", action="store_true",
+                        help="report progress for the Windows setup (lines starting with @@ on stdout)")
     args = parser.parse_args()
 
     if "%d.%d" % sys.version_info[:2] not in SUPPORTED_PYTHONS:
@@ -1231,8 +1574,8 @@ def main():
         sys.exit("This is the Microsoft Store version of Python, which can't install AI Fuzzy Select: "
                  "Windows keeps the files it creates under AppData in a private folder, where GIMP "
                  "doesn't see them.\nInstall Python 3.14 from https://www.python.org/downloads/ "
-                 "(install.bat finds it by itself) and run the installer again. The Store Python can "
-                 "stay installed.")
+                 "and run the installer with it, e.g.  py -3.14 install_ai_select.py (the Windows setup "
+                 "installs one by itself). The Store Python can stay installed.")
 
     install_dir = args.install_dir.resolve()
     if IS_WINDOWS and len(str(install_dir)) > 60:
@@ -1251,7 +1594,10 @@ def main():
     # SAM 2.1 large needs about 1.5 GB of GPU memory, more with soft edges: on a 2 GB GPU it
     # ran out (the desktop uses some too), small needs about 0.6 GB.
     big_gpu = index.startswith("cu") and gpu is not None and (gpu[3] or 0) >= 3000
-    models = choose_models(args.model, args.sam2_checkpoint, index.startswith("cu"), big_gpu, install_dir)
+    if args.small_only and "large" in (args.model or []):
+        parser.error("--small-only and --model large don't go together")
+    models = choose_models(args.model, args.sam2_checkpoint, index.startswith("cu"), big_gpu, install_dir,
+                           args.small_only)
     if args.sam2_checkpoint and Path(args.sam2_checkpoint).name not in [MODELS[m][1] for m in models]:
         sys.exit(f"--sam2-checkpoint must be one of {', '.join(MODELS[m][1] for m in models)} "
                  "(the file name says which model it is)")
@@ -1259,10 +1605,15 @@ def main():
     if plugins_dir is None:
         sys.exit("No GIMP 3 user profile found. Start GIMP 3 once, or pass --gimp-plugins-dir.")
     gimp_console = find_gimp_console()
+    problem = gimp_python_problem(gimp_console)
+    if problem:
+        sys.exit(problem)
 
     print("AI Fuzzy Select installer")
     info(f"Install dir : {install_dir}")
-    info(f"GPU         : {f'{gpu[0]} ({gpu[3] or "?"} MiB, compute {gpu[1] or "unknown"}, driver {gpu[2]})' if gpu else 'none detected'}")
+    # (no quotes inside the nested f-string: Python 3.10 and 3.11 can't parse that)
+    gpu_text = f"{gpu[0]} ({gpu[3] or '?'} MiB, compute {gpu[1] or 'unknown'}, driver {gpu[2]})" if gpu else "none detected"
+    info(f"GPU         : {gpu_text}")
     info(f"PyTorch     : {index} wheels")
     info(f"SAM2 models : SAM 2.1 {' and '.join(models)} (starts with {models[0]})")
     info(f"Soft edges  : {'yes (ViTMatte)' if soft else 'no'}")
@@ -1277,6 +1628,10 @@ def main():
 
     py = venv_python(install_dir / "venv")
     src = install_dir / "src"
+    if args.progress:
+        global PROGRESS
+        PROGRESS = Progress(setup_stages(args, index, models, soft, install_dir, gimp_console))
+        PROGRESS.start("prepare")
     try:
         if args.test_only:
             settings_file = plugins_dir / "aiselect" / "aiselect_settings.json"
@@ -1312,18 +1667,42 @@ def main():
                         py, install_dir / "checkpoints" / "ViTMatte_B_DIS.pth", args.vitmatte_checkpoint)
                     settings.update({"vitmatteDir": str(vitmatte_dir), "vitmatteCheckpoint": str(vitmatte_ckpt)})
                 step("Installing the GIMP plugin")
+                PROGRESS.start("plugin")
                 install_plugin(plugins_dir, settings)
-        passed = run_tests(py, settings, plugins_dir / "aiselect", soft, index.startswith("cu"), gimp_console)
+        passed = run_tests(py, settings, plugins_dir / "aiselect", soft, index.startswith("cu"), gimp_console,
+                           args.full_tests)
     except InstallError as e:
         print(f"\nERROR: {e}")
+        if args.progress:
+            print(f"@@error {e}", flush=True)
+        sys.exit(1)
+    except OSError as e:  # a download that failed, a full disk
+        if not args.progress:
+            raise
+        print(f"@@error {e}", flush=True)
         sys.exit(1)
 
+    if args.progress:
+        PROGRESS.emit(final=True)
+        print(f"@@result {'passed' if passed else 'failed'}", flush=True)
+        print(f"@@size {sum(f.stat().st_size for f in install_dir.rglob('*') if f.is_file()) // 1024}", flush=True)
     print("\n" + "=" * 72)
-    print("All tests passed." if passed else "Some tests FAILED - see the output above.")
+    print(("All tests passed." if args.full_tests else "Everything works.") if passed
+          else "Some tests FAILED - see the output above.")
     print("  In GIMP (restart it if it's open): Select > AI Fuzzy Select...")
     print("=" * 72)
     sys.exit(0 if passed else 1)
 
 
 if __name__ == "__main__":
-    main()
+    if "--progress" in sys.argv:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")  # setup.iss reads UTF-8
+        print(f"@@pid {os.getpid()}", flush=True)  # to stop the install (with its children)
+        try:
+            main()
+        except SystemExit as e:
+            if isinstance(e.code, str):  # a reason not to install
+                print("@@error " + e.code.replace("\n", " "), flush=True)
+            raise
+    else:
+        main()

@@ -1,0 +1,73 @@
+# Builds the Windows setup (windows/setup.iss) and the zip.
+# - A pushed version tag (v1.4.0): both go into a draft release of that tag; publish it with
+#   the release notes when it looks right (until then the "latest" download links keep
+#   pointing at the previous release).
+# - Changes to the installer on main, or a manual run: both are kept as the run's artifact,
+#   to see that the setup still builds.
+name: Build the setup
+
+on:
+  push:
+    tags: ["v*"]
+    branches: [main]
+    paths: ["windows/**", "install_ai_select.py", "uninstall_ai_select.py", "gimp_ai_select/**",
+            ".github/workflows/release.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  INNO_URL: https://github.com/jrsoftware/issrc/releases/download/is-6_7_3/innosetup-6.7.3.exe
+  INNO_SHA256: 9c73c3bae7ed48d44112a0f48e66742c00090bdb5bef71d9d3c056c66e97b732
+  MSYS_NO_PATHCONV: "1"  # Git Bash: keep /DAppVersion=... and /VERYSILENT as they are
+
+jobs:
+  build:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Inno Setup 6.7.3
+        # (the runner's own Inno Setup, if it has one, may be older than setup.iss needs)
+        run: |
+          tmp=$(cygpath -u "$RUNNER_TEMP")
+          curl -fsSL -o "$tmp/innosetup.exe" "$INNO_URL"
+          echo "$INNO_SHA256  $tmp/innosetup.exe" | sha256sum -c
+          "$tmp/innosetup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER "/DIR=$(cygpath -w "$tmp/inno")"
+          test -f "$tmp/inno/ISCC.exe"
+
+      - name: Build the setup and the zip
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/v* ]]; then version="${GITHUB_REF_NAME#v}"; else version="0.0.0"; fi
+          "$(cygpath -u "$RUNNER_TEMP")/inno/ISCC.exe" "/DAppVersion=$version" windows/setup.iss
+          git archive --format=zip --prefix=gimp-ai-fuzzy-select/ -o gimp-ai-fuzzy-select.zip HEAD \
+            install.sh uninstall.sh install.command uninstall.command \
+            install_ai_select.py uninstall_ai_select.py gimp_ai_select assets README.md LICENSE
+          mv windows/output/gimp-ai-fuzzy-select-setup.exe .
+          sha256sum gimp-ai-fuzzy-select-setup.exe gimp-ai-fuzzy-select.zip
+
+      - name: Keep them as the run's artifact
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: gimp-ai-fuzzy-select
+          path: |
+            gimp-ai-fuzzy-select-setup.exe
+            gimp-ai-fuzzy-select.zip
+
+      - name: Put them in a draft release of the tag
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          files="gimp-ai-fuzzy-select-setup.exe gimp-ai-fuzzy-select.zip"
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" $files --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" $files --draft --verify-tag --title "$GITHUB_REF_NAME" \
+              --notes "Built from $GITHUB_SHA. Release notes to follow."
+          fi

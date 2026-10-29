@@ -8,8 +8,9 @@ the object cut out or masked, a mask or a channel, the layer sliced into a layer
 or the object removed and filled in with background.
 
 <p align="center">
-  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download.png" width="305" alt="Download Installer"></a><br>
-  <sub>For GIMP 3 on Windows and Linux: unzip it, then double-click <code>install.bat</code> (Windows) or run <code>sh install.sh</code> (Linux) · <a href="#installation">installation steps</a> · macOS untested</sub>
+  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select-setup.exe"><img src="assets/download-windows.png" height="56" alt="Installer for Windows"></a>&nbsp;&nbsp;
+  <a href="https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip"><img src="assets/download-linux-macos.png" height="56" alt="Installer for Linux/macOS"></a><br>
+  <sub>For GIMP 3 · Windows: run it · Linux and macOS: unzip it, then run <code>sh install.sh</code> · <a href="#installation">installation steps</a> · macOS untested</sub>
 </p>
 
 <img width="1920" height="1020" alt="AI_Fuzzy_Select" src="https://github.com/user-attachments/assets/2b375a6d-3563-4bd6-a517-694790976008" />
@@ -124,7 +125,7 @@ takes about 1-3 seconds (the first time a few seconds more, to load LaMa).
 
 | Option | What it does |
 |---|---|
-| Model | SAM 2.1 large (best quality) or SAM 2.1 small (about 3× faster, half the GPU memory). Switching analyses the image again; your clicks are kept. If the graphics card doesn't have enough memory, AI Fuzzy Select switches to small, and then to the processor (CPU), by itself. Without an NVIDIA GPU only small is installed (unless you ask the installer for large), and this option isn't shown |
+| Model | SAM 2.1 large (best quality) or SAM 2.1 small (about 3× faster, half the GPU memory). Switching analyses the image again; your clicks are kept. If the graphics card doesn't have enough memory, AI Fuzzy Select switches to small, and then to the processor (CPU), by itself. Without an NVIDIA GPU only small is installed (unless you choose large in the setup, or give the installer `--model large`), and this option isn't shown |
 | Granularity | Auto, Whole object, Part or Detail: whether each click selects, adds or subtracts a whole object or a part of it (e.g. tree → crown → branch) |
 | Threshold | Like Fuzzy Select's threshold: higher selects more, lower selects less (50 = SAM 2's own cut-off) |
 | Fill holes | Fill holes in the selection up to this diameter in pixels, e.g. a window in a wall you want selected as solid. Only holes completely surrounded by the selection are filled, and SAM 2 already includes holes smaller than about 10 px. 0 (default) = off, keeps every hole (e.g. sky between branches) |
@@ -179,27 +180,31 @@ installer and uninstaller stop a running backend before changing its files.
 
 ## Requirements
 
-- **GIMP 3** with Python plug-in support (included in the official Windows installer).
-  Tested with GIMP 3.2.6.
+- **GIMP 3.0 or newer** with Python plug-in support (included in the official Windows
+  installer). Tested with GIMP 3.2.6 and 3.0.4. GIMP 2.10 can't run it: its plug-ins use
+  Python 2 and an older interface. On Linux, GIMP's Python also needs Python's cairo
+  bindings, which the plug-in's window draws with: Ubuntu's desktop has them, on Debian
+  install them with `sudo apt install python3-gi-cairo` (the installer checks).
 - **Python 3.10–3.14, 64-bit**, to run the installer (not 3.15: PyTorch crashes on it). On Windows,
-  `install.bat` offers to install Python 3.14 for you if you don't have it, and on Linux
+  the setup installs Python 3.14 for you if you don't have it, and on Linux
   `install.sh` offers to download one just for AI Fuzzy Select. The plug-in's backend runs in a
   virtual environment the installer creates with this Python; GIMP's own Python is not
   used for the models.
 - **An NVIDIA GPU is strongly recommended.** Tested on a GeForce GTX 1050 Ti (2018) with 4 GB of
   video memory (driver 581.57). Older GPUs (compute capability below 7.5, e.g. GTX 10xx)
   get PyTorch's CUDA 12.6 build and newer ones the CUDA 13 build, so the NVIDIA driver must
-  support that CUDA version. Without an NVIDIA GPU everything runs on the CPU; this is
-  untested and analysing the image will be much slower.
+  support that CUDA version. Without an NVIDIA GPU everything runs on the CPU, and
+  analysing the image is much slower.
 - **Disk space:** with an NVIDIA GPU about 6 GB (PyTorch and other packages 4.4 GB, SAM 2.1
   large and small 1.1 GB, ViTMatte checkpoint and code 0.5 GB, LaMa 0.2 GB); without one
-  about 1.6 GB (PyTorch's CPU build is much smaller, and only SAM 2.1 small is installed:
-  on a CPU it analyses a photo in about 2.5 s, large takes about 9 s). About 0.5 GB less with
+  about 1.6 GB (PyTorch's CPU build is much smaller, and only SAM 2.1 small is installed
+  unless you choose large too: on a CPU small analyses a photo in about 2.5 s, large in
+  about 9 s). About 0.5 GB less with
   `--no-soft-edges`.
 - **Internet access** during installation, to download the packages and checkpoints.
 - **Operating system:** tested on Windows 11 (GIMP 3.2.6) and Ubuntu 26.04 (GIMP 3 from
-  apt), both with an NVIDIA GPU. The installer contains code for macOS, but **it has not
-  been tested on macOS**.
+  apt), both with an NVIDIA GPU, and on Debian 13 (GIMP 3.0.4 from apt, on the CPU). The
+  installer contains code for macOS, but **it has not been tested on macOS**.
 
 <sub>[↑ Back to contents](#contents)</sub>
 
@@ -209,31 +214,40 @@ On Windows:
 
 1. **Install GIMP 3** from [gimp.org](https://www.gimp.org/downloads/), start it once and close it.
    (The Microsoft Store version of GIMP is untested.)
-2. **Download [gimp-ai-fuzzy-select.zip](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip)**
-   and unzip it anywhere (right-click > Extract All).
-3. **Double-click `install.bat`** in the unzipped folder. If Windows asks whether to run it,
-   choose Run (or More info > Run anyway). If you don't have a suitable Python, it offers to
-   download Python 3.14 from python.org and install it for you first (about 32 MB, for your
-   user only, no administrator rights needed; the download is checked against python.org's
-   checksum). Then it downloads about 4 GB (about 1 GB without an NVIDIA GPU), sets
-   everything up and ends with a set of tests.
+2. **Download [gimp-ai-fuzzy-select-setup.exe](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select-setup.exe)**
+   and run it. The setup isn't signed with a code-signing certificate, so Windows may warn
+   first: if the browser says the file isn't commonly downloaded, choose Keep; if Windows says
+   it protected your PC, choose More info > Run anyway.
+3. **Follow the setup.** It checks for GIMP, Python, an NVIDIA graphics card and disk space.
+   If you don't have a suitable Python, it installs Python 3.14 from python.org for your user
+   (32 MB, checked against python.org's checksum). It asks which SAM 2.1 models to download:
+   large and small (recommended with an NVIDIA graphics card of 3 GB or more), or only small
+   (quicker, and 900 MB less to download). Then it downloads up to 4.5 GB (about 1 GB
+   without an NVIDIA graphics card), shows how far it has got, and checks that it works in GIMP.
+   No administrator rights are needed.
 4. **Start GIMP** (restart it if it's open) and use **Select > AI Fuzzy Select...**
 
-To install Python yourself instead: Python 3.14 from
-[python.org](https://www.python.org/downloads/) (the Windows installer, 64-bit; the default
-settings are fine). Not Python 3.15: PyTorch crashes on it. Not the Microsoft Store's Python
-either: Windows keeps the files it creates in a private folder, where GIMP doesn't see them,
-so the installer doesn't use it.
+Setup options, in a Command Prompt after `gimp-ai-fuzzy-select-setup.exe`: `/CPU` runs the AI
+on the processor even with an NVIDIA graphics card, `/MODEL=large` (large and small) or
+`/MODEL=small` (small only) chooses the models, and `/SILENT` installs without questions.
 
-The installer creates a virtual environment in `%LOCALAPPDATA%\gimp-ai-select`, installs
-PyTorch for your GPU, SAM 2 and (for soft edges) ViTMatte, downloads the checkpoints (and
-LaMa, for removing objects), copies the plug-in into GIMP's `plug-ins` folder and runs the
-tests. The unzipped folder isn't needed afterwards, except for uninstalling.
+The setup puts everything in `%LOCALAPPDATA%\gimp-ai-select` (a virtual environment with
+PyTorch for your graphics card, SAM 2 and, for soft edges, ViTMatte, and the checkpoints,
+with LaMa for removing objects), copies the plug-in into GIMP's `plug-ins` folder and checks
+that the AI and GIMP work.
+
+For the installer options below, on Windows too: download the
+[zip](https://github.com/Esbob/gimp-ai-fuzzy-select/releases/latest/download/gimp-ai-fuzzy-select.zip),
+unzip it, and run `py -3.14 install_ai_select.py` with the options in a Command Prompt in that
+folder. It needs a Python 3.10–3.14 from [python.org](https://www.python.org/downloads/)
+(64-bit): not 3.15, where PyTorch crashes, and not the Microsoft Store's Python, which keeps
+the files it creates in a private folder where GIMP doesn't see them.
 
 On Linux and macOS (macOS untested): download and unzip the same zip, then run `sh install.sh` in
 that folder in a terminal; on macOS you can instead double-click `install.command` (the first
 time, right-click it and choose Open). Install GIMP 3 first (on Ubuntu and Debian:
-`sudo apt install gimp`; tested on Ubuntu 26.04). On Linux, if there's no Python 3.10–3.14
+`sudo apt install gimp python3-gi-cairo`; tested on Ubuntu 26.04 and Debian 13), and start it
+once. On Linux, if there's no Python 3.10–3.14
 that can create virtual environments, `install.sh` offers to download Python 3.14 for AI Fuzzy
 Select: with [uv](https://github.com/astral-sh/uv) (its download checked against its SHA-256),
 about 50 MB, into the install folder, without sudo; the uninstaller removes it again. You can
@@ -242,18 +256,20 @@ instead install Python's venv package yourself, e.g. `sudo apt install python3-v
 With git: `git clone https://github.com/Esbob/gimp-ai-fuzzy-select`, then the same as above
 in that folder, or run `python install_ai_select.py` directly.
 
-Installer options go after `install.bat` in a Command Prompt, after `sh install.sh`, or
-after `python install_ai_select.py`:
+Installer options go after `sh install.sh` or after `python install_ai_select.py` (on
+Windows `py -3.14 install_ai_select.py`):
 
 | Option | Use |
 |---|---|
 | `--model large` / `--model small` | Which SAM 2.1 model to start with. With an NVIDIA GPU both are installed (switch in the window); without one only small, unless you ask for large here. Without it: large with an NVIDIA GPU of 3 GB or more, otherwise small |
+| `--small-only` | Install only SAM 2.1 small, also with an NVIDIA GPU (900 MB less to download) |
 | `--no-soft-edges` | Install SAM 2 only (no ViTMatte); the Soft edges option is greyed out |
 | `--sam2-checkpoint PATH` | Use an already downloaded `sam2.1_hiera_large.pt` or `sam2.1_hiera_small.pt` |
 | `--vitmatte-checkpoint PATH` | Use an already downloaded `ViTMatte_B_DIS.pth` |
 | `--install-dir PATH` | Install somewhere else (keep the path short on Windows) |
 | `--gimp-plugins-dir PATH` | GIMP's plug-ins folder, if it isn't found automatically |
-| `--test-only` | Re-run the tests on an existing installation |
+| `--test-only` | Check an existing installation again, without installing |
+| `--full-tests` | Run all the tests (every option, inside GIMP and in the plug-in's window; a few minutes) instead of the quick check that the AI and GIMP work |
 
 The ViTMatte checkpoint is downloaded from Google Drive, which sometimes refuses
 downloads; the installer then explains how to download it by hand.
@@ -262,14 +278,19 @@ downloads; the installer then explains how to download it by hand.
 
 ## Uninstalling
 
-Double-click `uninstall.bat` (Linux and macOS: `sh uninstall.sh`, or double-click
-`uninstall.command` on macOS; or run `python uninstall_ai_select.py`). It shows what it will
-remove and asks first: the plug-in from every GIMP 3 profile
+If you used the setup: in Windows' **Settings > Apps > Installed apps**, find **AI Fuzzy
+Select for GIMP** and choose Uninstall. It removes the plug-in, its downloads and its log
+files; Python stays. Close GIMP first.
+
+On Linux and macOS: run `sh uninstall.sh` in the unzipped folder, or double-click
+`uninstall.command` on macOS, or run `python uninstall_ai_select.py`. (On Windows, an install
+made with an earlier version's `install.bat` is removed by the `uninstall.bat` next to it, or
+by `py uninstall_ai_select.py`.) It shows what it will remove and asks first: the plug-in
+from every GIMP 3 profile
 (including your remembered options), the install folder with its virtual environment,
 sources and downloaded checkpoints, and the plug-in's log file. Checkpoints you gave the
 installer with `--sam2-checkpoint` or `--vitmatte-checkpoint` are yours and are kept.
-Close GIMP first. Options go after `uninstall.bat`, `sh uninstall.sh` or
-`python uninstall_ai_select.py`:
+Close GIMP first. Options go after `sh uninstall.sh` or `python uninstall_ai_select.py`:
 
 | Option | Use |
 |---|---|

@@ -2067,8 +2067,8 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
         req = dict(render_options(options), cmd="render", objects=objects, final=True, out=out)
         if output == "remove":
             if not remove_available(settings):
-                return ("Removing objects isn't installed yet: run the installer again "
-                        "(install.bat, or sh install.sh) to add it.")
+                return ("Removing objects isn't installed yet: run the installer again (on "
+                        "Windows the setup, on Linux and macOS sh install.sh) to add it.")
             Gimp.progress_set_text("AI Fuzzy Select: filling in the background...")
             req["patch_out"] = os.path.join(work, "patch.raw")
         reply = backend.call(req)

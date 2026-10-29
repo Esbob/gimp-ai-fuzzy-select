@@ -1,4 +1,3 @@
-# Batch files need Windows line endings, shell scripts Unix ones, also in downloaded zips
-*.bat -text
+# Shell scripts need Unix line endings, also in downloaded zips
 *.sh text eol=lf
 *.command text eol=lf
