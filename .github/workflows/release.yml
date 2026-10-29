@@ -47,7 +47,8 @@ jobs:
           "$(cygpath -u "$RUNNER_TEMP")/inno/ISCC.exe" "/DAppVersion=$version" windows/setup.iss
           git archive --format=zip --prefix=gimp-ai-fuzzy-select/ -o gimp-ai-fuzzy-select.zip HEAD \
             install.sh uninstall.sh install.command uninstall.command \
-            install_ai_select.py uninstall_ai_select.py gimp_ai_select assets README.md LICENSE
+            install_ai_select.py uninstall_ai_select.py gimp_ai_select assets README.md LICENSE \
+            ':(exclude)assets/butterfly.svg'
           mv windows/output/gimp-ai-fuzzy-select-setup.exe .
           sha256sum gimp-ai-fuzzy-select-setup.exe gimp-ai-fuzzy-select.zip
 
