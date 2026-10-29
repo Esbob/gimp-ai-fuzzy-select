@@ -137,6 +137,38 @@ def load_json(path, default):
         return default
 
 
+def image_key(image):
+    """What the remembered options belong to: the image's file (opened or saved; also after
+    GIMP restarts), or for an image never saved, its number in this GIMP session (GIMP is the
+    plug-in's parent process)."""
+    file = image.get_file()
+    path = file.get_path() if file else None
+    return {"file": path} if path else {"gimp": os.getppid(), "image": image.get_id()}
+
+
+REMEMBERED_IMAGES = 20  # the options of this many images, the last used first
+
+
+def remembered():
+    """[{"image": key, "options": {...}}, ...]. (A file from before 1.4.1 holds just one
+    image's options, without saying which: forgotten.)"""
+    saved = load_json(OPTIONS_FILE, {})
+    return saved.get("images", []) if isinstance(saved, dict) else []
+
+
+def load_options(key):
+    """The options remembered for this image, else the defaults: another image's options
+    aren't meant for this one."""
+    mine = next((r["options"] for r in remembered() if r.get("image") == key), {})
+    return dict(DEFAULT_OPTIONS, **mine)
+
+
+def save_options(key, options):
+    others = [r for r in remembered() if r.get("image") != key]
+    with open(OPTIONS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"images": [{"image": key, "options": options}] + others[:REMEMBERED_IMAGES - 1]}, f)
+
+
 # --- Backend process ----------------------------------------------------------------
 
 
@@ -1985,7 +2017,8 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
     # Filters > Repeat Last runs with last values, but the clicks are made in the window:
     # open it, as for a normal run.
     interactive = run_mode != Gimp.RunMode.NONINTERACTIVE
-    options = dict(DEFAULT_OPTIONS, **load_json(OPTIONS_FILE, {}))
+    key = image_key(image)  # (now: the image may be closed before the options are saved)
+    options = load_options(key)
     options["remove_context"] = min(100, options["remove_context"])  # (it went to 300 before)
     models = list(settings.get("models", {}))  # installed SAM2 models, the default first
     if settings.get("model") in models:
@@ -2044,8 +2077,7 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
             log(f"dialog response={response} objects={json.dumps(objects)} options={json.dumps(options)}")
             if response != Gtk.ResponseType.OK or not objects:
                 return None
-            with open(OPTIONS_FILE, "w", encoding="utf-8") as f:
-                json.dump(options, f)
+            save_options(key, options)
             # GIMP stays usable while the window is open: the clicks were made on the image
             # as it was then.
             if (not image.is_valid() or (image.get_width(), image.get_height()) != size

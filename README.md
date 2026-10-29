@@ -137,8 +137,10 @@ takes about 1-3 seconds (the first time a few seconds more, to load LaMa).
 | Surroundings | Only for **Remove the object**: how much of the image around the object is used to make up the background (see [Removing an object](#removing-an-object)) |
 | Existing selection in GIMP | Only for a Selection result, and only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
-Your options are remembered between runs (saved when you confirm with the main button);
-**Reset to defaults** at the bottom of the options puts them all back.
+Your options are remembered for the image you chose them for (saved when you confirm with
+the main button): run AI Fuzzy Select on that image again, also after restarting GIMP if it's
+saved as a file, and they're back; another image starts with the defaults. **Reset to
+defaults** at the bottom of the options puts them all back.
 
 ### Viewing
 

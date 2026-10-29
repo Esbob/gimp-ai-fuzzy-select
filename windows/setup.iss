@@ -360,12 +360,14 @@ begin
     Both := Both + ' (recommended)'
   else
     Small := Small + ' (recommended)';
-  if HasNvidia then begin
-    ModelPage.Description := 'SAM 2.1 comes in two sizes.';
+  ModelPage.Description := 'The AI that finds the object you click is SAM 2.1, Meta''s Segment '
+    + 'Anything Model. It comes in two sizes.';
+  if HasNvidia then
     Both := Both + ': the best selections. If the large model doesn''t fit in the memory of your '
-      + 'graphics card, the small model will automatically be used. 1.1 GB';
-  end else begin
-    ModelPage.Description := 'Without an NVIDIA graphics card, the AI runs on the processor.';
+      + 'graphics card, the small model will automatically be used. 1.1 GB'
+  else begin
+    ModelPage.Description := ModelPage.Description + ' Without an NVIDIA graphics card, it runs '
+      + 'on the processor.';
     Both := Both + ': the best selections, but large is slow on the processor. 1.1 GB';
   end;
   ModelPage.CheckListBox.ItemCaption[0] := Both;
