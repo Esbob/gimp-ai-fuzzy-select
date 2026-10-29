@@ -76,6 +76,10 @@ is held.
 With **Result: Slices**, the window cuts the current layer into a layer per object plus
 one for everything else (the rest):
 
+<img src="assets/examples/slicing.png" width="100%" alt="Left: four shopping bags clicked as four slices, each in its own colour. Right: GIMP's Layers panel afterwards, with a layer group holding a layer per bag and the rest, above the original layer, which is hidden">
+
+<sub>Four clicks, four slices: **Slice** puts each bag on its own layer, cropped to it, and the rest on another.</sub>
+
 | Action | Effect |
 |---|---|
 | Click / Drag | Make the object a new slice |
@@ -102,6 +106,10 @@ image: click a sign, a bin, a cable or a passer-by and it's gone. The background
 a new layer right above the current layer, cropped to the object and transparent around it,
 so the original stays untouched: hide or delete that layer to bring the object back, or erase
 parts of it.
+
+<img src="assets/examples/remove-object.png" width="100%" alt="Left: four shopping bags in a car boot, selected with the things sticking out of them. Right: the same boot, empty, its cover and floor filled in">
+
+<sub>A click on each bag and on what sticks out of them, Grow at 8 px, then **Remove**: the empty boot is made up by LaMa.</sub>
 
 You see the result before pressing Remove: the **Result** view (next to Overlay and Mask;
 the **R** key switches to it and back) shows the image with the object removed, at full
@@ -315,5 +323,9 @@ versions:
 - ViTMatte code and checkpoint from [Matte Anything](https://github.com/hustvl/Matte-Anything) (MIT), for soft edges
 - [LaMa](https://github.com/advimman/lama) by Samsung AI Center (Apache 2.0), for removing objects, as the TorchScript file [IOPaint](https://github.com/Sanster/IOPaint) uses
 - [detectron2](https://github.com/facebookresearch/detectron2) by Meta (Apache 2.0), for loading ViTMatte
+
+The photo in the slicing and removal pictures above comes from the
+[SAM 2 repository](https://github.com/facebookresearch/sam2/tree/main/notebooks/images)
+(Apache 2.0).
 
 <sub>[↑ Back to contents](#contents)</sub>
