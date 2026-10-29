@@ -29,16 +29,17 @@ jobs:
       run:
         shell: bash
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Inno Setup 6.7.3
-        # (the runner's own Inno Setup, if it has one, may be older than setup.iss needs)
+        # (the runner's own Inno Setup, if it has one, may be older than setup.iss needs.
+        # Relative and Windows paths: with MSYS_NO_PATHCONV, curl.exe and the installer get
+        # paths unchanged, and don't understand /d/a/_temp/...)
         run: |
-          tmp=$(cygpath -u "$RUNNER_TEMP")
-          curl -fsSL -o "$tmp/innosetup.exe" "$INNO_URL"
-          echo "$INNO_SHA256  $tmp/innosetup.exe" | sha256sum -c
-          "$tmp/innosetup.exe" /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER "/DIR=$(cygpath -w "$tmp/inno")"
-          test -f "$tmp/inno/ISCC.exe"
+          curl -fsSL -o innosetup.exe "$INNO_URL"
+          echo "$INNO_SHA256  innosetup.exe" | sha256sum -c
+          ./innosetup.exe /VERYSILENT /SUPPRESSMSGBOXES /NORESTART /CURRENTUSER "/DIR=$RUNNER_TEMP\\inno"
+          test -f "$(cygpath -u "$RUNNER_TEMP")/inno/ISCC.exe"
 
       - name: Build the setup and the zip
         run: |
