@@ -66,6 +66,7 @@ PREVIEW_MAX = 2560  # long side of the selection overlay the backend renders
 DEFAULT_OPTIONS = {
     "output": "selection", "hover": True, "granularity": "auto", "threshold": 50, "fill_holes": 0, "grow": 0, "feather": 0,
     "sharp": False, "soft": False, "edge": 4, "operation": "replace", "remove_context": 20,
+    "snap": 10,  # slices: close gaps in the rest up to this wide (px); 0 = off
     "model": "",  # "" = the installed default (aiselect_settings.json)
 }
 # SAM 2.1 models the installer can set up: dropdown text and tooltip. (On real photos large
@@ -75,7 +76,7 @@ MODEL_LABELS = {
     "small": ("SAM 2.1 small", "faster"),
 }
 RENDER_OPTIONS = ("threshold", "granularity", "fill_holes", "grow", "feather", "sharp", "soft", "edge",
-                  "remove_context")
+                  "remove_context", "snap")
 
 
 # Results with hard edges (no soft edges or feather): slices, so that each pixel is in
@@ -735,6 +736,25 @@ class AISelectDialog(Gtk.Dialog):
             child.show()
         side.pack_start(self.remove_box, False, False, 0)
 
+        # Slicing: gaps in the rest between slices that touch go to those slices
+        self.snap_box = Gtk.Box(spacing=6)
+        label = Gtk.Label(label="Snap gaps (px)", xalign=0)
+        self.snap = spin(0, 100, "snap")
+        tip = ("Where two slices almost touch, the thin line of pixels between them (an outline, "
+               "a light halo drawn around an object) would end up in the rest layer. Gaps in the "
+               "rest up to this wide, between two slices or between a slice and the image's edge, "
+               "go to the slices around them instead, split along the edge in the image. Rest "
+               "next to only one slice stays rest. 0 = off. The status line shows how many "
+               "pixels snapped.")
+        for widget in (label, self.snap):
+            widget.set_tooltip_text(tip)
+        self.snap_box.pack_start(label, False, False, 0)
+        self.snap_box.pack_start(self.snap, True, True, 0)
+        self.snap_box.set_no_show_all(True)
+        for child in self.snap_box.get_children():
+            child.show()
+        side.pack_start(self.snap_box, False, False, 0)
+
         reset = Gtk.Button(label="Reset to defaults")
         reset.set_tooltip_text("Put all options back to their defaults (your clicks are kept). "
                                "Saved when you confirm with the main button.")
@@ -814,6 +834,7 @@ class AISelectDialog(Gtk.Dialog):
         if self.has_selection:
             self.operation.set_active_id(d["operation"])
         self.remove_context.set_value(d["remove_context"])
+        self.snap.set_value(d["snap"])
         # (not the model: switching it analyses the image again)
         self.options.update({k: v for k, v in d.items() if k != "model"},
                             soft=d["soft"] and self.soft_available)
@@ -849,6 +870,7 @@ class AISelectDialog(Gtk.Dialog):
             self.soft.set_tooltip_text(hard or self.soft_tip)
         removing = output == "remove"
         self.remove_box.set_visible(removing)
+        self.snap_box.set_visible(slicing)
         self.result_button.set_sensitive(removing)
         if removing:
             self.result_button.set_active(True)
@@ -1577,6 +1599,8 @@ class AISelectDialog(Gtk.Dialog):
         if self.slicing():
             n = len(reply["slices"])
             status = f"{n} slice{'s' * (n != 1)}, " + status
+            if self.options["snap"]:
+                status += f", {reply.get('snapped', 0)} px snapped"
         if shown:
             status += f", {' and '.join(shown)} shown"
         status += f", {reply['seconds']:.1f} s)" if soft else f", {reply['seconds'] * 1000:.0f} ms)"
@@ -2035,6 +2059,7 @@ def ai_select_steps(procedure, run_mode, image, drawables, config):
             options[key] = config.get_property(key)
         options["fill_holes"] = config.get_property("fill-holes")
         options["remove_context"] = config.get_property("remove-context")
+        options["snap"] = config.get_property("snap")
         options["model"] = options["model"] or ""  # GIMP gives None for an unset string
         for key, allowed in (("granularity", GRANULARITIES), ("operation", tuple(OPERATIONS)),
                              ("output", tuple(OUTPUTS)), ("model", ("",) + tuple(models))):
@@ -2172,6 +2197,9 @@ class AISelect(Gimp.PlugIn):
         procedure.add_int_argument("remove-context", "Surroundings",
                                    "Removing an object: how much of the image around it is used to make up the "
                                    "background (% of its size on each side)", 0, 100, 20, rw)
+        procedure.add_int_argument("snap", "Snap gaps", "Slices: gaps in the rest up to this wide (px) "
+                                   "between two slices, or a slice and the image's edge, go to those "
+                                   "slices; 0 = off", 0, 100, 10, rw)
         procedure.add_string_argument("operation", "Operation", "replace, add, subtract or intersect",
                                       "replace", rw)
         procedure.add_string_argument("output", "Result", "selection, layer, cutout, mask, channel, slices or remove",

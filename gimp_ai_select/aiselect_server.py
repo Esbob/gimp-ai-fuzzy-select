@@ -48,10 +48,12 @@ starts with {"cmd": "hello", "token": ...}.
       inside a slice splits it) and a sign -1 object giving them back to the rest (slice
       0). Fill holes and
       grow apply to each object; edges stay hard (no soft edges or feather), so every
-      pixel belongs to exactly one slice. The preview colours each slice; final writes
-      the slice number of each pixel (8-bit, image size) to "out". The reply's "slices"
-      lists the slices that have pixels: {"slice", "area"}, final also "box" [x1, y1,
-      x2, y2].
+      pixel belongs to exactly one slice. "snap": px closes gaps in the rest up to that
+      wide between two slices or a slice and the image's edge (see snap_gaps; 0 = off).
+      The preview colours each slice; final writes the slice number of each pixel (8-bit,
+      image size) to "out". The reply's "slices" lists the slices that have pixels:
+      {"slice", "area"}, final also "box" [x1, y1, x2, y2]; "snapped" counts the pixels
+      that snap gave to a slice.
       "sharp": sharper outlines, worked out in the background; a preview uses the ones
       that are ready and the reply's "sharp_pending" counts those still being worked out
       ("sharp_refined": those used). A final render waits for them.
@@ -135,6 +137,63 @@ def grow_mask(mask, px):
     k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * abs(px) + 1,) * 2)
     m8 = mask.astype(np.uint8)
     return (cv2.dilate(m8, k) if px > 0 else cv2.erode(m8, k)).astype(bool)
+
+
+def snap_gaps(labels, image, gap):
+    """Slicing: gaps in the rest at most `gap` px wide between two slices, or between a
+    slice and the image's edge, go to the slices around them. SAM2's outlines of two
+    touching objects rarely meet exactly: on a 4K drawing a tower and the sky behind it
+    left a rim of 1500 (5 px) to 8000 (9 px) pixels, the light halo drawn around the tower,
+    in the rest. A rest pixel snaps when its distances to the two nearest slices (or the
+    nearest slice and the image's edge) add up to at most gap + 1, so rest next to only one
+    slice stays rest. A gap is split along the strongest edge in `image` (a watershed from
+    the slices around it), so a halo goes with the sky it resembles and an ink line with
+    the object. Changes `labels` (image size, 0 = the rest) in place; returns the number of
+    pixels that snapped."""
+    rest = labels == 0
+    if gap <= 0 or rest.all() or not rest.any():
+        return 0
+    h, w = labels.shape
+    # Only near both the rest and a slice can anything snap: work on that part of the image.
+    near = rest & disk_dilate(~rest, gap + 1)
+    if not near.any():
+        return 0
+    ys, xs = np.nonzero(near)
+    m = gap + 2
+    y1, y2, x1, x2 = max(ys.min() - m, 0), min(ys.max() + m + 1, h), max(xs.min() - m, 0), min(xs.max() + m + 1, w)
+    crop = labels[y1:y2, x1:x2]
+    far = np.float32(gap + 2)  # (no nearer than this: can't snap)
+    d1 = np.full(crop.shape, far, np.float32)  # distance to the nearest slice
+    d2 = d1.copy()  # and to the nearest other slice
+    l1 = np.zeros(crop.shape, np.uint8)  # the nearest slice
+    for k in np.flatnonzero(np.bincount(crop.ravel(), minlength=256)[1:]) + 1:
+        is_k = crop == k
+        rows, cols = np.flatnonzero(is_k.any(1)), np.flatnonzero(is_k.any(0))
+        by1, by2 = max(rows[0] - m, 0), min(rows[-1] + m + 1, crop.shape[0])
+        bx1, bx2 = max(cols[0] - m, 0), min(cols[-1] + m + 1, crop.shape[1])
+        part = crop[by1:by2, bx1:bx2]
+        dk = cv2.distanceTransform((part != k).view(np.uint8), cv2.DIST_L2, 5)
+        a1, a2, al = d1[by1:by2, bx1:bx2], d2[by1:by2, bx1:bx2], l1[by1:by2, bx1:bx2]
+        nearer = dk < a1
+        a2[:] = np.where(nearer, a1, np.minimum(a2, dk))
+        a1[nearer] = dk[nearer]
+        al[nearer] = k
+    yy = np.arange(y1, y2, dtype=np.float32)[:, None]
+    xx = np.arange(x1, x2, dtype=np.float32)[None, :]
+    edge = np.minimum(np.minimum(yy + 1, h - yy), np.minimum(xx + 1, w - xx))  # to the image's edge
+    snap = (crop == 0) & (d1 + np.minimum(d2, edge) <= gap + 1)
+    if not snap.any():
+        return 0
+    # Split each gap along the image's strongest edge: a watershed from the slices, with the
+    # rest that doesn't snap as a seed of its own so the slices can't flood into it.
+    markers = crop.astype(np.int32)
+    markers[crop == 0] = 256
+    markers[snap] = 0
+    cv2.watershed(np.ascontiguousarray(image[y1:y2, x1:x2]), markers)
+    won = markers[snap]
+    # watershed lines (-1) and anything the rest's seed reached go to the nearest slice
+    crop[snap] = np.where((won >= 1) & (won <= 255), won, l1[snap]).astype(np.uint8)
+    return int(snap.sum())
 
 
 class Server:
@@ -778,9 +837,13 @@ class Server:
                 labels[mask] = 0
                 owner[mask] = np.iinfo(np.uint32).max
         # For hover_splits: the object sizes only on every n-th pixel (about 1000 along the long
-        # side), which is all it reads; in full they took 4 bytes a pixel (192 MB at 8000 px)
+        # side), which is all it reads; in full they took 4 bytes a pixel (192 MB at 8000 px).
+        # It goes by the slices as clicked, before snapping: a snapped pixel is still rest
+        # that a click takes, not a slice it would split.
         n = max(1, round(max(h, w) / 1000))
-        self.slice_state = (self.image, labels, owner[::n, ::n].copy(), n, {})
+        snap = int(req.get("snap", 0))
+        self.slice_state = (self.image, labels.copy() if snap > 0 else labels, owner[::n, ::n].copy(), n, {})
+        self.snapped = snap_gaps(labels, self.image, snap)
         return labels
 
     def hover_splits(self, mask):
@@ -905,7 +968,7 @@ class Server:
         labels = self.slice_labels(req)
         counts = np.bincount(labels.ravel(), minlength=256)
         slices = [{"slice": int(k), "area": int(counts[k])} for k in np.flatnonzero(counts[1:]) + 1]
-        reply = {"area": int(counts[1:].sum()), "slices": slices}
+        reply = {"area": int(counts[1:].sum()), "slices": slices, "snapped": self.snapped}
         if req.get("final"):
             for s in slices:
                 x, y, bw, bh = cv2.boundingRect((labels == s["slice"]).view(np.uint8))

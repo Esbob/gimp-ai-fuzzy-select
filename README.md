@@ -96,7 +96,9 @@ dashes, next to the outline of what it would select.
 slice cropped to its object, and hides the original layer. Every pixel is in exactly one of
 them, so together they look exactly like the original layer, and merging the group gives it
 back pixel for pixel. That's why slices have hard edges: Soft edges and Feather are off
-while slicing.
+while slicing. Where two slices almost touch, a thin line of pixels between them often
+belongs to neither, so it ends up in the rest layer. **Snap gaps** (see [Options](#options))
+adds those pixels to the two slices instead.
 
 ### Removing an object
 
@@ -143,6 +145,7 @@ takes about 1-3 seconds (the first time a few seconds more, to load LaMa).
 | Soft edges (ViTMatte) | Turn fuzzy edges such as fur and hair into a partial selection with [ViTMatte](https://github.com/hustvl/ViTMatte), picking out individual hairs near the object's outline. On hard edges it mostly makes the outline smoother and more accurate. The effect is best seen in the **Mask** view. The preview shows soft edges a moment after each change; pressing **Select** computes them at full resolution |
 | Result | What the main button creates: a **Selection** (default); a **New layer with mask** (a copy of the current layer with the result as its layer mask; non-destructive, so you can fix it later by painting on the mask); a **New layer with only the object** (a plain cut-out: everything outside the object is deleted); a **Mask on current layer**; a **Channel**, leaving GIMP's selection alone; **Slices** (see [Slicing an image into layers](#slicing-an-image-into-layers)); or **Remove the object** (see [Removing an object](#removing-an-object)) |
 | Surroundings | Only for **Remove the object**: how much of the image around the object is used to make up the background (see [Removing an object](#removing-an-object)) |
+| Snap gaps | Only for **Slices**: where two slices almost touch, the thin line of pixels between them (an outline, or a light halo drawn around an object) would end up in the rest. Gaps in the rest up to this many pixels wide, between two slices or between a slice and the image's edge, go to the slices around them instead, split along the edge in the image. Rest next to only one slice stays rest. 10 by default; 0 = off. The status line shows how many pixels snapped |
 | Existing selection in GIMP | Only for a Selection result, and only shown when your image in GIMP already has a selection: whether pressing **Select** replaces it, adds to it, subtracts from it or intersects with it. Without an existing selection, the result simply becomes the selection |
 
 Your options are remembered for the image you chose them for (saved when you confirm with

@@ -894,6 +894,23 @@ inside = call(cmd="hover", point=[400, 300], granularity="detail", slices=True)
 outside = call(cmd="hover", point=[700, 80], granularity="auto", slices=True)
 res["slices"]["hover shows the split"] = (inside["splits"]["click"] == [1] and outside["splits"]["click"] == []
                                           and bool(inside["slice_outlines"].get("1")))
+# Snap gaps: the rim of rest between the disc and the sky goes to them; the rest next to only
+# one slice (the strands across the sky) stays rest, and the slices keep their own pixels.
+pair = [dict(click[0], slice=1), {"sign": 1, "points": [[700, 80, 1]], "slice": 2}]
+lab0, _ = slice_render(pair)
+r = call(cmd="render", objects=pair, slices=True, final=True, out=out, snap=6)
+lab_s = np.fromfile(out, np.uint8).reshape(true.shape)
+dist = [cv2.distanceTransform((lab0 != k).astype(np.uint8), cv2.DIST_L2, 5) for k in (1, 2)]
+rim = (lab0 == 0) & (dist[0] + dist[1] <= 7)
+H, W = true.shape
+yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+edge = np.minimum(np.minimum(yy + 1, H - yy), np.minimum(xx + 1, W - xx))
+lone = (lab0 == 0) & (np.minimum(dist[0], dist[1]) + np.minimum(np.maximum(dist[0], dist[1]), edge) > 7)
+res["snap_rim"] = int(rim.sum())
+res["snap"] = {"rim closed": bool(rim.any() and (lab_s[rim] != 0).all()),
+               "lone rest kept": bool(lone.any() and (lab_s[lone] == 0).all()),
+               "slices kept": bool((lab_s[lab0 != 0] == lab0[lab0 != 0]).all()),
+               "count": r["snapped"] == int(((lab0 == 0) & (lab_s != 0)).sum())}
 t0 = time.time()
 res["mae_sharp"] = float(np.abs(final(click, sharp=True) - true).mean())
 res["sharp_s"] = round(time.time() - t0, 1)
@@ -1220,6 +1237,16 @@ try:
     dlg.hover_at([400, 300])
     pump(lambda: dlg.hover_polygons is not None, 30)
     res["slice_hover"] = dlg.hover_splits is not None and "click" in dlg.hover_splits[0]
+    # Snap gaps: shown only when slicing; the status says how many pixels snapped
+    visible = dlg.snap_box.get_visible()
+    dlg.set_status("waiting")
+    dlg.snap.set_value(6)
+    pump(lambda: "selected" in dlg.status.get_text(), 30)
+    snapped = "px snapped" in dlg.status.get_text()
+    dlg.snap.set_value(0)
+    dlg.output.set_active_id("selection")
+    res["snap_row"] = [visible, snapped, not dlg.snap_box.get_visible()]
+    dlg.output.set_active_id("slices")
     if settings.get("lamaCheckpoint"):  # removing an object: also hard edges
         dlg.output.set_active_id("remove")
         res["remove_hard_edges"] = (dlg.output.get_active_id() == "remove" and not dlg.feather.get_sensitive()
@@ -1276,6 +1303,9 @@ def run_backend_test(py, work, plugin_dir, settings, soft):
         (all(r["slices"].values()),
          f"slices: a smaller object keeps its pixels in either order, Ctrl gives them back, every pixel in one "
          f"({'OK' if all(r['slices'].values()) else r['slices']}; preview {r['slice_preview_ms']} ms)"),
+        (all(r["snap"].values()),
+         f"snap gaps gives the rim between two slices to them and keeps other rest "
+         f"({r['snap_rim']} px rim; {'OK' if all(r['snap'].values()) else r['snap']})"),
         (r["mae_sharp"] <= r["mae_click"] + 0.002,
          f"sharper outlines work (error vs true alpha {r['mae_sharp']:.4f} vs {r['mae_click']:.4f}, {r['sharp_s']} s)"),
         # A hover during the refinement must not wait for it. (Both slow down together when
@@ -1407,7 +1437,7 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
               and "selected" in r["click"] and r["objects"] == [1, 1, -1] and bool(r["box_object"]) and "1 box" in r["box_drag"] and r["shift_cursor"]
               and r["select_enabled"] and (switch is None or (switch[1] and "selected" in switch[2]))
               and r["slice_numbers"] == [1, 2, 2, None] and "2 slices" in r["slice_status"]
-              and r["slice_hard_edges"] and r["slice_hover"] and r.get("remove_hard_edges", True)
+              and r["slice_hard_edges"] and r["slice_hover"] and all(r["snap_row"]) and r.get("remove_hard_edges", True)
               and all(r.get("remove_shown", [True])) and all(r.get("remove_switch", [True])))
     (ok if passed else fail)(
         f"window: options disabled while loading {r['sidebar_disabled_while_loading']}, ready "
@@ -1416,6 +1446,7 @@ def run_window_test(gimp_console, plugin_dir, settings, work):
         + (f"; switched to model {switch[0]}, clicks kept {switch[1]}: {switch[2]!r}" if switch else "")
         + f"; slices {r['slice_numbers']}, soft edges and feather off {r['slice_hard_edges']}: {r['slice_status']!r}"
         + f"; hover shows the slices a click would split {r['slice_hover']}"
+        + f"; snap gaps shown when slicing, counted in the status, hidden otherwise {r['snap_row']}"
         + (f"; remove the object offered, with soft edges and feather off: {r['remove_hard_edges']}; "
            f"the object removed shown, in the Result view, with the area option, said in the status, busy "
            f"cursor while waiting, and not after: "
